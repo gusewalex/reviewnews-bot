@@ -7,11 +7,11 @@ from urllib.parse import urlparse
 import feedparser
 import requests
 import trafilatura
+from lxml import html as lxml_html
 from openai import OpenAI
 
 # ---------- Налаштування ----------
 FEEDS = [
-    "https://assets.censor.net/rss/censor.net/rss_uk_news.xml",
     "https://www.pravda.com.ua/rss/view_news/",
     "https://24tv.ua/rss/all.xml?googleFlg=true&tagId=1117",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
@@ -55,12 +55,17 @@ PROMPT = """Ти досвідчений редактор українськог�
    але не менше 3 абзаців.
 8. Прибери з тексту рекламу, заклики підписатися, фрази на кшталт
    «читайте також» та підписи фотографів.
+9. Позначки (хештеги): визнач 3 найважливіші позначки за змістом новини.
+   Це ключові особи (прізвище), місця (місто, країна), організації або
+   головна тема. Кожна позначка: одне слово (максимум два), у називному
+   відмінку, великими літерами, без #. Приклад: ["КИЇВ", "КОРУПЦІЯ", "ЗЕЛЕНСЬКИЙ"].
 
 Поверни JSON з полями:
 - "title": новий інформативний заголовок до 90 символів, без клікбейту і
   без лапок-ялинок на початку,
 - "content": текст новини у HTML (кожен абзац у <p>),
-- "excerpt": короткий опис в 1-2 речення.
+- "excerpt": короткий опис в 1-2 речення,
+- "tags": список із 3 позначок, великими літерами.
 """
 
 
@@ -77,12 +82,95 @@ def save_seen(seen):
 
 
 def get_article(url):
-    """Повертає (текст, посилання на картинку) зі сторінки новини."""
+    """Повертає (текст, посилання на картинку, HTML сторінки)."""
     html = requests.get(url, headers=HEADERS, timeout=30).text
     text = trafilatura.extract(html) or ""
     meta = trafilatura.extract_metadata(html)
     image = meta.image if meta and meta.image else None
-    return text, image
+    return text, image, html
+
+
+# ---------- Підпис до фото (як у новині-першоджерелі) ----------
+CAPTION_HINT = re.compile(
+    r"caption|credit|photo-?(?:source|author|desc)|img-?(?:source|author|desc)"
+    r"|image-?(?:source|author|desc)|source-?photo",
+    re.I,
+)
+CREDIT_RE = re.compile(
+    r"(?:Ілюстративне фото|Фото з відкритих джерел|Фото|Фотограф|Photo|Credit)"
+    r"\s*[:：]\s*[^\n]{2,150}",
+    re.I,
+)
+
+
+def _clean(t):
+    return re.sub(r"\s+", " ", t or "").strip()
+
+
+def _caption_from_text(t):
+    """Підпис = текст елемента, якщо він короткий; інакше фрагмент 'Фото: ...'."""
+    t = _clean(t)
+    if not t:
+        return None
+    if len(t) <= 200:
+        return t
+    m = CREDIT_RE.search(t)
+    return _clean(m.group(0)) if m else None
+
+
+def find_photo_caption(html_text, image_url):
+    """Шукає на сторінці новини підпис до головного фото
+    (наприклад, 'Фото: Getty Images'). Повертає текст або None."""
+    if not image_url or not html_text:
+        return None
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        return None
+
+    # 1) Знаходимо саме це зображення на сторінці й беремо його підпис
+    name = image_url.split("?")[0].rstrip("/").split("/")[-1]
+    if len(name) >= 5:
+        for img in doc.iter("img"):
+            attrs = " ".join(
+                img.get(a) or "" for a in ("src", "data-src", "data-lazy-src", "srcset", "data-srcset")
+            )
+            if name not in attrs:
+                continue
+            node = img
+            for _ in range(4):  # піднімаємось на кілька рівнів угору
+                node = node.getparent()
+                if node is None:
+                    break
+                if node.tag == "figure":
+                    fc = node.find(".//figcaption")
+                    if fc is not None:
+                        c = _caption_from_text(fc.text_content())
+                        if c:
+                            return c
+                for el in node.iter():
+                    if el is img or not isinstance(el.tag, str):
+                        continue
+                    cls = (el.get("class") or "") + " " + (el.get("id") or "")
+                    if el.tag == "figcaption" or CAPTION_HINT.search(cls):
+                        c = _caption_from_text(el.text_content())
+                        if c:
+                            return c
+                m = CREDIT_RE.search(_clean(node.text_content()))
+                if m and len(_clean(node.text_content())) <= 400:
+                    return _clean(m.group(0))
+
+    # 2) Запасний варіант: перший підпис 'Фото: ...' у статті
+    scope = doc.xpath("//article") or [doc]
+    for el in scope[0].iter():
+        if not isinstance(el.tag, str):
+            continue
+        cls = (el.get("class") or "") + " " + (el.get("id") or "")
+        if el.tag == "figcaption" or CAPTION_HINT.search(cls):
+            t = _clean(el.text_content())
+            if t and len(t) <= 200 and CREDIT_RE.search(t):
+                return t
+    return None
 
 
 def entry_image(entry):
@@ -186,10 +274,11 @@ def upload_image(url):
 
 def add_image_to_content(content, image_url, caption, alt):
     """Вставляє фото з підписом у текст статті, після першого абзацу."""
+    figcaption = f"<figcaption>{escape(caption)}</figcaption>" if caption else ""
     figure = (
         '<figure class="wp-block-image size-large">'
         f'<img src="{escape(image_url)}" alt="{escape(alt)}"/>'
-        f"<figcaption>{escape(caption)}</figcaption>"
+        f"{figcaption}"
         "</figure>"
     )
     idx = content.find("</p>")
@@ -199,13 +288,55 @@ def add_image_to_content(content, image_url, caption, alt):
     return content[:idx] + "\n" + figure + "\n" + content[idx:]
 
 
-def create_post(data, source_url, image_id, image_url, status):
+def clean_tags(raw):
+    """Лишає до 3 унікальних позначок великими літерами."""
+    tags = []
+    for t in raw or []:
+        t = re.sub(r"[#,]", " ", str(t))
+        t = re.sub(r"\s+", " ", t).strip().upper()
+        if t and t not in tags:
+            tags.append(t)
+    return tags[:3]
+
+
+def get_tag_ids(names):
+    """Знаходить або створює позначки у WordPress, повертає їхні ID."""
+    ids = []
+    for name in clean_tags(names):
+        try:
+            r = requests.get(
+                f"{WP_URL}/wp-json/wp/v2/tags",
+                auth=auth,
+                params={"search": name, "per_page": 20},
+                timeout=30,
+            )
+            r.raise_for_status()
+            found = next(
+                (t["id"] for t in r.json() if t["name"].strip().upper() == name), None
+            )
+            if found is None:
+                r = requests.post(
+                    f"{WP_URL}/wp-json/wp/v2/tags",
+                    auth=auth,
+                    json={"name": name},
+                    timeout=30,
+                )
+                if r.status_code == 400 and r.json().get("code") == "term_exists":
+                    found = r.json()["data"]["term_id"]
+                else:
+                    r.raise_for_status()
+                    found = r.json()["id"]
+            if found not in ids:
+                ids.append(found)
+        except Exception as e:
+            print("Позначку не додано:", name, "->", e)
+    return ids
+
+
+def create_post(data, image_id, image_url, caption, status, tag_ids=None):
     content = data["content"]
     if image_url:
-        domain = urlparse(source_url).netloc.removeprefix("www.")
-        content = add_image_to_content(
-            content, image_url, f"Фото: {domain}", data["title"]
-        )
+        content = add_image_to_content(content, image_url, caption, data["title"])
     payload = {
         "title": data["title"],
         "content": content,
@@ -214,6 +345,8 @@ def create_post(data, source_url, image_id, image_url, status):
     }
     if image_id:
         payload["featured_media"] = image_id
+    if tag_ids:
+        payload["tags"] = tag_ids
     resp = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", auth=auth, json=payload, timeout=60)
     resp.raise_for_status()
     return resp.json().get("link")
@@ -251,19 +384,26 @@ def main():
             continue
 
         try:
-            text, image = get_article(link)
+            text, image, page_html = get_article(link)
             if len(text) < 300:
                 print("Занадто короткий текст, пропускаю:", link)
                 seen.append(link)
                 continue
 
             data, status = rewrite_checked(entry.get("title", ""), text)
-            image_id, wp_image_url = None, None
+            image_id, wp_image_url, caption = None, None, None
             img_url = image or entry_image(entry)
             if img_url:
                 image_id, wp_image_url = upload_image(img_url)
+                caption = find_photo_caption(page_html, img_url)
+                print("Підпис до фото:", caption or "(не знайдено, без підпису)")
 
-            post_link = create_post(data, link, image_id, wp_image_url, status)
+            tag_ids = get_tag_ids(data.get("tags"))
+            print("Позначки:", clean_tags(data.get("tags")))
+
+            post_link = create_post(
+                data, image_id, wp_image_url, caption, status, tag_ids
+            )
             print(f"Створено ({status}):", post_link)
             seen.append(link)
             done += 1
