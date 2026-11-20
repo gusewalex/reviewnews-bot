@@ -2,7 +2,7 @@ name: WordPress news bot
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # кожні 30 хвилин
+    - cron: "*/5 * * * *"   # кожні 5 хвилин
   workflow_dispatch:          # дозволяє запускати вручну кнопкою
 
 permissions:
