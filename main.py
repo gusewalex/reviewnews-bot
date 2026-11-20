@@ -182,12 +182,7 @@ def upload_image(url):
 
 
 def create_post(data, source_url, image_id, status):
-    domain = urlparse(source_url).netloc
-    content = (
-        data["content"]
-        + f'\n<p><em>Джерело: <a href="{source_url}" target="_blank" '
-        f'rel="nofollow noopener">{domain}</a></em></p>'
-    )
+    content = data["content"]
     payload = {
         "title": data["title"],
         "content": content,
