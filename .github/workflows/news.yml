@@ -3,10 +3,14 @@ name: WordPress news bot
 on:
   schedule:
     - cron: "*/5 * * * *"   # кожні 5 хвилин
-  workflow_dispatch:          # дозволяє запускати вручну кнопкою
+  workflow_dispatch:         # дозволяє запускати вручну кнопкою
 
 permissions:
   contents: write
+
+concurrency:
+  group: news-bot
+  cancel-in-progress: false  # наступний запуск чекає завершення попереднього
 
 jobs:
   run:
@@ -27,9 +31,8 @@ jobs:
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          POST_STATUS: publish   # змініть на publish, коли будете впевнені в якості
-          MAX_POSTS: "5"
-          OPENAI_MODEL: gpt-4.1
+          POST_STATUS: publish   # publish = одразу на сайт, draft = у чернетки
+          MAX_POSTS: "3"         # скільки нових новин за один запуск
         run: python main.py
 
       - name: Save list of processed news
@@ -37,4 +40,4 @@ jobs:
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
           git add seen.json
-          git diff --staged --quiet || (git commit -m "update seen list" && git push)
+          git diff --staged --quiet || (git commit -m "update seen list" && git pull --rebase && git push)
