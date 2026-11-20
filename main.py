@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from html import escape
 from urllib.parse import urlparse
 
 import feedparser
@@ -10,6 +11,7 @@ from openai import OpenAI
 
 # ---------- Налаштування ----------
 FEEDS = [
+    "https://assets.censor.net/rss/censor.net/rss_uk_news.xml",
     "https://www.pravda.com.ua/rss/view_news/",
     "https://24tv.ua/rss/all.xml?googleFlg=true&tagId=1117",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
@@ -158,7 +160,7 @@ def rewrite_checked(title, text):
 
 
 def upload_image(url):
-    """Завантажує картинку у WordPress, повертає її ID (або None)."""
+    """Завантажує картинку у WordPress, повертає (ID, адреса на вашому сайті)."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
@@ -175,14 +177,35 @@ def upload_image(url):
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["id"]
+        j = resp.json()
+        return j["id"], j.get("source_url")
     except Exception as e:
         print("Картинку не завантажено:", e)
-        return None
+        return None, None
 
 
-def create_post(data, source_url, image_id, status):
+def add_image_to_content(content, image_url, caption, alt):
+    """Вставляє фото з підписом у текст статті, після першого абзацу."""
+    figure = (
+        '<figure class="wp-block-image size-large">'
+        f'<img src="{escape(image_url)}" alt="{escape(alt)}"/>'
+        f"<figcaption>{escape(caption)}</figcaption>"
+        "</figure>"
+    )
+    idx = content.find("</p>")
+    if idx == -1:
+        return figure + "\n" + content
+    idx += len("</p>")
+    return content[:idx] + "\n" + figure + "\n" + content[idx:]
+
+
+def create_post(data, source_url, image_id, image_url, status):
     content = data["content"]
+    if image_url:
+        domain = urlparse(source_url).netloc.removeprefix("www.")
+        content = add_image_to_content(
+            content, image_url, f"Фото: {domain}", data["title"]
+        )
     payload = {
         "title": data["title"],
         "content": content,
@@ -196,38 +219,56 @@ def create_post(data, source_url, image_id, status):
     return resp.json().get("link")
 
 
+def collect_entries():
+    """Збирає новини з усіх джерел, чергуючи їх (по одній з кожного),
+    щоб одне джерело не займало весь ліміт за запуск."""
+    per_feed = []
+    for feed_url in FEEDS:
+        try:
+            feed = feedparser.parse(feed_url, agent=HEADERS["User-Agent"])
+            per_feed.append(list(feed.entries[:15]))
+            print(f"{feed_url}: знайдено {len(feed.entries)} новин")
+        except Exception as e:
+            print("Не вдалося прочитати стрічку", feed_url, "->", e)
+
+    mixed = []
+    for i in range(15):
+        for entries in per_feed:
+            if i < len(entries):
+                mixed.append(entries[i])
+    return mixed
+
+
 def main():
     seen = load_seen()
     done = 0
 
-    for feed_url in FEEDS:
-        feed = feedparser.parse(feed_url, agent=HEADERS["User-Agent"])
-        for entry in feed.entries[:15]:
-            if done >= MAX_POSTS:
-                break
-            link = entry.get("link")
-            if not link or link in seen:
+    for entry in collect_entries():
+        if done >= MAX_POSTS:
+            break
+        link = entry.get("link")
+        if not link or link in seen:
+            continue
+
+        try:
+            text, image = get_article(link)
+            if len(text) < 300:
+                print("Занадто короткий текст, пропускаю:", link)
+                seen.append(link)
                 continue
 
-            try:
-                text, image = get_article(link)
-                if len(text) < 300:
-                    print("Занадто короткий текст, пропускаю:", link)
-                    seen.append(link)
-                    continue
+            data, status = rewrite_checked(entry.get("title", ""), text)
+            image_id, wp_image_url = None, None
+            img_url = image or entry_image(entry)
+            if img_url:
+                image_id, wp_image_url = upload_image(img_url)
 
-                data, status = rewrite_checked(entry.get("title", ""), text)
-                image_id = None
-                img_url = image or entry_image(entry)
-                if img_url:
-                    image_id = upload_image(img_url)
-
-                post_link = create_post(data, link, image_id, status)
-                print(f"Створено ({status}):", post_link)
-                seen.append(link)
-                done += 1
-            except Exception as e:
-                print("Помилка з новиною", link, "->", e)
+            post_link = create_post(data, link, image_id, wp_image_url, status)
+            print(f"Створено ({status}):", post_link)
+            seen.append(link)
+            done += 1
+        except Exception as e:
+            print("Помилка з новиною", link, "->", e)
 
     save_seen(seen)
     print(f"Готово. Нових матеріалів: {done}")
