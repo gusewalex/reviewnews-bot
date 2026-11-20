@@ -10,6 +10,7 @@ from openai import OpenAI
 # ---------- Налаштування ----------
 FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
+    "https://24tv.ua/rss/all.xml?googleFlg=true&tagId=1117",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
