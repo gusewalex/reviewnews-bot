@@ -9,7 +9,7 @@ from openai import OpenAI
 
 # ---------- Налаштування ----------
 FEEDS = [
-    "https://assets.censor.net/rss/censor.net/rss_uk_news.xml",
+    "https://www.pravda.com.ua/rss/view_news/",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
