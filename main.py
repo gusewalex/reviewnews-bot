@@ -23,7 +23,7 @@ WP_USER = os.environ["WP_USER"]
 WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-POST_STATUS = os.environ.get("POST_STATUS", "draft")  # draft або publish
+POST_STATUS = os.environ.get("POST_STATUS", "publish")  # draft або publish
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "30"))     # скільки новин за один запуск
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
