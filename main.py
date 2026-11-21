@@ -27,6 +27,7 @@ POST_STATUS = os.environ.get("POST_STATUS", "publish")  # draft або publish
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "30"))     # скільки новин за один запуск
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
+MIN_QUOTE_LEN = int(os.environ.get("MIN_QUOTE_LEN", "40"))  # коротші фрази в лапках не вважаємо цитатами
 MIN_TEXT = 120                                         # мінімальна довжина тексту новини
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -65,6 +66,13 @@ PROMPT = """Ти досвідчений редактор українськог�
    Це ключові особи (прізвище), місця (місто, країна), організації або
    головна тема. Кожна позначка: одне слово (максимум два), у називному
    відмінку, великими літерами, без #. Приклад: ["КИЇВ", "КОРУПЦІЯ", "ЗЕЛЕНСЬКИЙ"].
+10. Джерела інформації: обов'язково зберігай, хто повідомив чи заявив
+    (наприклад «Про це пише ERR», «Повідомляє ДСНС», «Заявив Президент
+    на своїй сторінці у Facebook»). Якщо слово або назва в оригіналі є
+    посиланням, збережи його в тексті як HTML:
+    <a href="адреса" target="_blank" rel="noopener">назва</a>
+    на тому самому слові, з тією самою адресою. Адреси не змінюй і не
+    вигадуй. Посилань, яких немає в оригіналі, не додавай.
 
 Поверни JSON з полями:
 - "title": новий інформативний заголовок до 90 символів, без клікбейту і
@@ -166,18 +174,42 @@ def sanitize_caption(caption):
     return f"{prefix.strip()}: {', '.join(good)}"
 
 
-def find_photo_caption(html_text, image_url):
-    """Шукає на сторінці новини підпис до головного фото
-    (наприклад, 'Фото: Getty Images'). Повертає текст або None."""
-    if not image_url or not html_text:
+CREDIT_START_RE = re.compile(
+    r"^\s*(?:Ілюстративне фото|Фото з відкритих джерел|Фото|Фотограф|Photo|Credit)\s*[:：]",
+    re.I,
+)
+INLINE_TAGS = {"span", "a", "b", "i", "em", "strong", "small", "br", "u", "font", "abbr", "time"}
+
+
+def _text(el):
+    return _clean(" ".join(el.itertext()))
+
+
+def _is_credit_el(el):
+    """Елемент, весь текст якого це підпис «Фото: ...» (без вкладених абзаців)."""
+    if not isinstance(el.tag, str) or el.tag in ("script", "style"):
+        return None
+    if any(not isinstance(ch.tag, str) or ch.tag not in INLINE_TAGS for ch in el):
+        return None
+    t = _text(el)
+    if t and len(t) <= 200 and CREDIT_START_RE.match(t):
+        return t
+    return None
+
+
+def find_photo_caption(html_text, image_url, is_main=False):
+    """Шукає на сторінці новини підпис до фото (наприклад, 'Фото: Getty Images').
+    Повертає текст підпису або None."""
+    if not html_text:
         return None
     try:
         doc = lxml_html.fromstring(html_text)
     except Exception:
         return None
 
-    # 1) Знаходимо саме це зображення на сторінці й беремо його підпис
-    name = image_url.split("?")[0].rstrip("/").split("/")[-1]
+    # 1) Знаходимо саме це зображення й беремо підпис, що стоїть біля нього
+    target = None
+    name = (image_url or "").split("?")[0].rstrip("/").split("/")[-1]
     if len(name) >= 5:
         for img in doc.iter("img"):
             attrs = " ".join(
@@ -185,15 +217,17 @@ def find_photo_caption(html_text, image_url):
             )
             if name not in attrs:
                 continue
+            if target is None:
+                target = img
             node = img
             for _ in range(4):  # піднімаємось на кілька рівнів угору
                 node = node.getparent()
-                if node is None:
-                    break
+                if node is None or len(node.xpath(".//img")) > 1:
+                    break  # у блоці кілька фото: підпис неоднозначний
                 if node.tag == "figure":
                     fc = node.find(".//figcaption")
                     if fc is not None:
-                        c = _caption_from_text(fc.text_content())
+                        c = _caption_from_text(_text(fc))
                         if c:
                             return c
                 for el in node.iter():
@@ -201,23 +235,99 @@ def find_photo_caption(html_text, image_url):
                         continue
                     cls = (el.get("class") or "") + " " + (el.get("id") or "")
                     if el.tag == "figcaption" or CAPTION_HINT.search(cls):
-                        c = _caption_from_text(el.text_content())
+                        c = _caption_from_text(_text(el))
                         if c:
                             return c
-                m = CREDIT_RE.search(_clean(node.text_content()))
-                if m and len(_clean(node.text_content())) <= 400:
-                    return _clean(m.group(0))
 
-    # 2) Запасний варіант: перший підпис 'Фото: ...' у статті
-    scope = doc.xpath("//article") or [doc]
-    for el in scope[0].iter():
-        if not isinstance(el.tag, str):
+    # 2) Найближчий до фото елемент «Фото: ...» (зазвичай одразу під фото)
+    elements = [
+        el for el in doc.iter() if isinstance(el.tag, str) and el.tag not in ("script", "style")
+    ]
+    pos = {el: i for i, el in enumerate(elements)}
+    credits = []
+    for el in elements:
+        t = _is_credit_el(el)
+        if t:
+            credits.append((pos[el], t, el))
+
+    if target is not None and target in pos:
+        ti = pos[target]
+        best = None
+        for ci, t, _el in credits:
+            d = ci - ti
+            if 0 <= d <= 12 or -4 <= d < 0:
+                score = d if d >= 0 else 100 - d  # підписи після фото в пріоритеті
+                if best is None or score < best[0]:
+                    best = (score, t)
+        if best:
+            return best[1]
+
+    # 3) Для головного фото: перший підпис «Фото: ...» у статті
+    if is_main and credits:
+        scope = doc.xpath("//article")
+        if scope:
+            inside = set(scope[0].iter())
+            for _ci, t, el in credits:
+                if el in inside:
+                    return t
+        else:
+            return credits[0][1]
+    return None
+
+
+def rss_caption(entry):
+    """Підпис до фото, який є безпосередньо в RSS-записі новини
+    (media:credit, підписи в описі, alt зображення тощо)."""
+    cands = []
+
+    mc = entry.get("media_credit")
+    if mc:
+        for it in (mc if isinstance(mc, list) else [mc]):
+            val = it.get("content") if isinstance(it, dict) else str(it)
+            if val and _clean(val):
+                cands.append("Фото: " + _clean(val))  # media:credit містить лише автора/джерело
+
+    for key in ("media_content", "enclosures"):
+        for it in entry.get(key, []) or []:
+            if isinstance(it, dict):
+                for k in ("credit", "description"):
+                    v = it.get(k)
+                    if isinstance(v, str):
+                        c = _caption_from_text(v)
+                        if c:
+                            cands.append(c)
+
+    htmls = []
+    for c in entry.get("content", []) or []:
+        if isinstance(c, dict) and c.get("value"):
+            htmls.append(c["value"])
+    for k in ("summary", "description"):
+        if entry.get(k):
+            htmls.append(entry[k])
+
+    for raw in htmls:
+        try:
+            doc = lxml_html.fromstring("<div>" + raw + "</div>")
+        except Exception:
             continue
-        cls = (el.get("class") or "") + " " + (el.get("id") or "")
-        if el.tag == "figcaption" or CAPTION_HINT.search(cls):
-            t = _clean(el.text_content())
-            if t and len(t) <= 200 and CREDIT_RE.search(t):
-                return t
+        for fc in doc.iter("figcaption"):
+            c = _caption_from_text(_text(fc))
+            if c:
+                cands.append(c)
+        for img in doc.iter("img"):
+            for a in ("alt", "title"):
+                v = _clean(img.get(a) or "")
+                if v and len(v) <= 200 and CREDIT_START_RE.match(v):
+                    cands.append(v)
+        for el in doc.iter():
+            t = _is_credit_el(el)
+            if t:
+                cands.append(t)
+
+    for c in cands:
+        c = sanitize_caption(c)
+        if c:
+            return c
     return None
 
 
@@ -331,9 +441,21 @@ def entry_image(entry):
 
 
 # ---------- Перевірка цитат ----------
+_n = MIN_QUOTE_LEN
 QUOTE_RE = re.compile(
-    r"«([^»]{15,})»|„([^“”]{15,})[“”]|“([^”]{15,})”|\"([^\"]{15,})\""
+    r"«([^»]{%d,})»|„([^“”]{%d,})[“”]|“([^”]{%d,})”|\"([^\"]{%d,})\"" % (_n, _n, _n, _n)
 )
+
+# рядки-«сміття», які не є частиною новини (посилання на інші матеріали тощо)
+NOISE_RE = re.compile(
+    r"^\s*(?:читайте також|дивіться також|також читайте|читайте ще|читайте далі"
+    r"|за темою|джерело|фото|відео)\b.*$",
+    re.I | re.M,
+)
+
+
+def strip_noise(text):
+    return NOISE_RE.sub("", text)
 
 
 def norm(s):
@@ -369,28 +491,177 @@ def rewrite(title, text, extra=""):
     return json.loads(resp.choices[0].message.content)
 
 
-def rewrite_checked(title, text):
-    """Переписує новину й перевіряє, що прямі цитати збережені дослівно.
-    Повертає (дані, статус_публікації)."""
-    data = rewrite(title, text)
-    miss = missing_quotes(text, data["content"])
-    if not miss:
-        return data, POST_STATUS
+# ---------- Посилання на джерела в тексті ----------
+SHARE_RE = re.compile(
+    r"sharer|/share[/?]|/intent/|share\.php|addthis|^mailto:|^tel:|^javascript:|^#", re.I
+)
+CTA_RE = re.compile(
+    r"підписуйт|підписатис|підпишіть|читайте нас|наш телеграм|наш канал|приєднуйтес|слідкуйте",
+    re.I,
+)
 
-    print("Цитати змінено, пробую ще раз:", miss)
-    extra = (
-        "У попередній спробі ці прямі цитати були змінені. "
-        "Вони мають бути в тексті ДОСЛІВНО, без жодних змін:\n- "
-        + "\n- ".join(miss)
+
+def _host(u):
+    return urlparse(u).netloc.lower().removeprefix("www.")
+
+
+def url_key(u):
+    """Нормалізована адреса для порівняння (без http/www, # і кінцевого /)."""
+    u = (u or "").strip().lower()
+    u = re.sub(r"^https?://", "", u)
+    u = re.sub(r"^www\.", "", u)
+    return u.split("#")[0].rstrip("/")
+
+
+def find_source_links(html_text, page_url):
+    """Зовнішні посилання на джерела в тексті статті (наприклад, «Про це пише ERR»).
+    Повертає список {anchor, url, context}. Посилання на сам сайт-джерело,
+    меню, кнопки «поділитися» та заклики підписатися пропускаються."""
+    if not html_text:
+        return []
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        return []
+
+    found = doc.xpath("//article")
+    scope = found[0] if found else doc
+    page_host = _host(page_url)
+    result, seen_keys = [], set()
+
+    for a in scope.iter("a"):
+        href = (a.get("href") or "").strip()
+        if not href or SHARE_RE.search(href):
+            continue
+        url = urljoin(page_url, href)
+        if not url.lower().startswith("http"):
+            continue
+        host = _host(url)
+        if not host or host == page_host or host.endswith("." + page_host):
+            continue
+        anchor = _text(a)
+        if not anchor or len(anchor) > 150:
+            continue
+
+        par, bad = None, False
+        for anc in a.iterancestors():
+            if anc is scope or not isinstance(anc.tag, str) or anc.tag in ("body", "html"):
+                break
+            if anc.tag in ("aside", "footer", "nav"):
+                bad = True
+                break
+            if SKIP_CONTAINER.search((anc.get("class") or "") + " " + (anc.get("id") or "")):
+                bad = True
+                break
+            if par is None and anc.tag in ("p", "blockquote", "li"):
+                par = anc
+        if bad or par is None:
+            continue
+        context = _text(par)
+        if CTA_RE.search(context):
+            continue
+
+        key = url_key(url)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        result.append({"anchor": anchor, "url": url, "context": context[:250]})
+        if len(result) >= 8:
+            break
+    return result
+
+
+def format_links(links):
+    if not links:
+        return ""
+    lines = [
+        "Посилання з оригіналу. Кожне з них ОБОВ'ЯЗКОВО збережи в переписаному тексті "
+        'як HTML-посилання <a href="адреса" target="_blank" rel="noopener">слово або '
+        "назва, на яких воно стоїть</a> (адресу не змінюй). Згадки про те, хто повідомив "
+        "чи заявив, також залишай:"
+    ]
+    for i, l in enumerate(links, 1):
+        lines.append(f"{i}. «{l['anchor']}» → {l['url']} (абзац в оригіналі: «{l['context']}»)")
+    return "\n".join(lines)
+
+
+A_TAG_RE = re.compile(r"<a\s[^>]*?href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.I | re.S)
+
+
+def clean_links(content, links):
+    """Лишає тільки посилання, що були в оригіналі (вигадані прибирає, текст лишає)."""
+    allowed = {url_key(l["url"]) for l in links}
+
+    def repl(m):
+        href = m.group(1)
+        if href.lower().startswith("http") and url_key(href) in allowed:
+            return m.group(0)
+        return m.group(2)
+
+    return A_TAG_RE.sub(repl, content)
+
+
+def missing_links(links, content):
+    present = {url_key(m.group(1)) for m in A_TAG_RE.finditer(content)}
+    return [l for l in links if url_key(l["url"]) not in present]
+
+
+def append_missing_links(content, missing):
+    items = ", ".join(
+        f'<a href="{escape(l["url"])}" target="_blank" rel="noopener">{escape(l["anchor"])}</a>'
+        for l in missing
     )
-    data = rewrite(title, text, extra)
-    miss = missing_quotes(text, data["content"])
-    if not miss:
-        return data, POST_STATUS
+    return content + f"\n<p>Посилання: {items}</p>"
 
-    # Не вдалося зберегти цитати: залишаємо як чернетку для ручної перевірки
-    print("Цитати все ще не збігаються, зберігаю як чернетку:", miss)
-    return data, "draft"
+
+def add_target_blank(content):
+    """Посилання відкриваються в новій вкладці."""
+    return re.sub(r"<a\s+(?![^>]*\btarget=)", '<a target="_blank" rel="noopener" ', content, flags=re.I)
+
+
+def rewrite_checked(title, text, links=None):
+    """Переписує новину; перевіряє, що прямі цитати збережені дослівно
+    і що збережено посилання на джерела. Повертає (дані, статус_публікації)."""
+    links = links or []
+    text = strip_noise(text)  # прибираємо «читайте також» тощо до переписування
+    notes = format_links(links)
+
+    data = rewrite(title, text, notes)
+    data["content"] = clean_links(data["content"], links)
+    miss_q = missing_quotes(text, data["content"])
+    miss_l = missing_links(links, data["content"])
+
+    if miss_q or miss_l:
+        extra = notes
+        if miss_q:
+            print("Цитати змінено, пробую ще раз:", miss_q)
+            extra += (
+                "\n\nУ попередній спробі ці прямі цитати були змінені. "
+                "Вони мають бути в тексті ДОСЛІВНО, без жодних змін:\n- "
+                + "\n- ".join(miss_q)
+            )
+        if miss_l:
+            print("Втрачено посилання, пробую ще раз:", [l["url"] for l in miss_l])
+            extra += (
+                "\n\nУ попередній спробі було втрачено ці посилання. Збережи їх "
+                "обов'язково як <a href=...> на відповідному слові:\n- "
+                + "\n- ".join(f"«{l['anchor']}» → {l['url']}" for l in miss_l)
+            )
+        data = rewrite(title, text, extra)
+        data["content"] = clean_links(data["content"], links)
+        miss_q = missing_quotes(text, data["content"])
+        miss_l = missing_links(links, data["content"])
+
+    if miss_l:  # гарантуємо, що посилання не втрачені
+        print("Посилання додано в кінець статті:", [l["url"] for l in miss_l])
+        data["content"] = append_missing_links(data["content"], miss_l)
+    data["content"] = add_target_blank(data["content"])
+
+    if miss_q:
+        # Не вдалося зберегти цитати: залишаємо як чернетку для ручної перевірки
+        print("Цитати все ще не збігаються, зберігаю як чернетку:", miss_q)
+        return data, "draft"
+    return data, POST_STATUS
 
 
 def upload_image(url):
@@ -418,12 +689,9 @@ def upload_image(url):
         return None, None
 
 
-DEFAULT_CAPTION = "Фото з відкритих джерел"  # якщо в джерелі підпису немає
-
-
 def build_figure(image_url, caption, alt):
-    caption = caption or DEFAULT_CAPTION  # підпис є завжди
-    figcaption = f"<figcaption>{escape(caption)}</figcaption>"
+    # підпис лише той, що знайдено на сайті-джерелі; немає підпису, немає й рядка
+    figcaption = f"<figcaption>{escape(caption)}</figcaption>" if caption else ""
     return (
         '<figure class="wp-block-image size-large">'
         f'<img src="{escape(image_url)}" alt="{escape(alt)}"/>'
@@ -601,14 +869,26 @@ def main():
                     save_seen(seen)
                 continue
 
-            data, status = rewrite_checked(entry.get("title", ""), text)
+            links = find_source_links(page_html, link) if page_ok else []
+            if links:
+                print("Посилання на джерела в оригіналі:", [(l["anchor"], l["url"]) for l in links])
+            data, status = rewrite_checked(entry.get("title", ""), text, links)
 
             image_id, images = None, []
             img_url = image or entry_image(entry)
             if img_url:
                 image_id, wp_url = upload_image(img_url)
-                caption = sanitize_caption(find_photo_caption(page_html, img_url))
-                print("Підпис до головного фото:", caption or f"({DEFAULT_CAPTION})")
+                caption = sanitize_caption(rss_caption(entry))
+                cap_src = "RSS"
+                if not caption:
+                    caption = sanitize_caption(
+                        find_photo_caption(page_html, img_url, is_main=True)
+                    )
+                    cap_src = "сторінка новини"
+                print(
+                    "Підпис до головного фото:",
+                    f"{caption} (знайдено: {cap_src})" if caption else f"(підпису на сайті-джерелі не знайдено, фото без підпису: {link})",
+                )
                 if wp_url:
                     images.append((wp_url, caption))
 
@@ -618,7 +898,7 @@ def main():
                 if not wp_url:
                     continue
                 cap = sanitize_caption(find_photo_caption(page_html, extra))
-                print("Додаткове фото:", extra, "| підпис:", cap or f"({DEFAULT_CAPTION})")
+                print("Додаткове фото:", extra, "| підпис:", cap or "(не знайдено, без підпису)")
                 images.append((wp_url, cap))
 
             tag_ids = get_tag_ids(data.get("tags"))
