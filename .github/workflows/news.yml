@@ -42,5 +42,31 @@ jobs:
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
-          git add seen.json
-          git diff --staged --quiet || (git commit -m "update seen list" && git pull --rebase && git push)
+          cp seen.json /tmp/mine.json 2>/dev/null || echo "[]" > /tmp/mine.json
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+            python - <<'PY'
+          import json
+
+          def load(path):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return []
+
+          merged = list(dict.fromkeys(load("seen.json") + load("/tmp/mine.json")))[-2000:]
+          with open("seen.json", "w", encoding="utf-8") as f:
+              json.dump(merged, f, ensure_ascii=False, indent=1)
+          PY
+            git add seen.json
+            if git diff --staged --quiet; then
+              break
+            fi
+            git commit -m "update seen list"
+            if git push origin HEAD:main; then
+              break
+            fi
+            sleep 5
+          done
