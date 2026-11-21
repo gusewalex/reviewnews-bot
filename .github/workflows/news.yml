@@ -2,7 +2,7 @@ name: WordPress news bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # кожні 5 хвилин
+    - cron: "*/10 * * * *"   # GitHub запускає перевірку приблизно кожні 10 хвилин
   workflow_dispatch:         # дозволяє запускати вручну кнопкою
     inputs:
       mark_only:
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -31,74 +31,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Process Telegram links
-        if: ${{ !inputs.mark_only }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
-          WP_URL: ${{ secrets.WP_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          POST_STATUS: publish
-          MAX_IMAGES: "4"
-        run: python telegram_poll.py
-        continue-on-error: true
-
-      - name: Run RSS bot
+      - name: Run bot
         env:
           WP_URL: ${{ secrets.WP_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          POST_STATUS: publish   # publish = одразу на сайт, draft = у чернетки
-          MAX_POSTS: "30"        # скільки нових новин за один запуск
-          MAX_ENTRIES: "60"      # скільки останніх новин читати з кожної стрічки
-          MARK_SEEN_ONLY: ${{ inputs.mark_only }}   # службовий режим (кнопка при ручному запуску)
+          POST_STATUS: publish        # publish = одразу на сайт, draft = у чернетки
+          MAX_POSTS: "30"             # скільки нових новин за одну перевірку
+          MAX_ENTRIES: "60"           # скільки останніх новин читати зі стрічки
+          RUN_LOOP_MINUTES: "30"      # бот працює безперервно 30 хв, перевіряючи стрічку кожні 4 хв (0 = одна перевірка)
+          POLL_SECONDS: "240"
+          MARK_SEEN_ONLY: ${{ inputs.mark_only }}
         run: python main.py
 
       - name: Save list of processed news
-        if: always()             # зберігаємо список навіть якщо запуск завершився помилкою
-        run: |
-          git config user.name "news-bot"
-          git config user.email "news-bot@users.noreply.github.com"
-          cp seen.json /tmp/mine.json 2>/dev/null || echo "[]" > /tmp/mine.json
-          cp telegram_offset.json /tmp/telegram_offset.json 2>/dev/null || echo '{"offset": 0}' > /tmp/telegram_offset.json
-          for i in 1 2 3 4 5; do
-            git fetch origin main
-            git reset --hard origin/main
-            python - <<'PY'
-          import json
-
-          def load(path):
-              try:
-                  with open(path, encoding="utf-8") as f:
-                      return json.load(f)
-              except Exception:
-                  return []
-
-          merged = list(dict.fromkeys(load("seen.json") + load("/tmp/mine.json")))[-2000:]
-          with open("seen.json", "w", encoding="utf-8") as f:
-              json.dump(merged, f, ensure_ascii=False, indent=1)
-
-          def load_offset(path):
-              try:
-                  with open(path, encoding="utf-8") as f:
-                      return int(json.load(f).get("offset", 0))
-              except Exception:
-                  return 0
-
-          offset = max(load_offset("telegram_offset.json"), load_offset("/tmp/telegram_offset.json"))
-          with open("telegram_offset.json", "w", encoding="utf-8") as f:
-              json.dump({"offset": offset}, f, ensure_ascii=False, indent=2)
-          PY
-            git add seen.json telegram_offset.json
-            if git diff --staged --quiet; then
-              break
-            fi
-            git commit -m "update seen list"
-            if git push origin HEAD:main; then
-              break
-            fi
-            sleep 5
-          done
+        if: always()                  # зберігаємо список навіть якщо запуск завершився помилкою
+        run: python save_seen.py
