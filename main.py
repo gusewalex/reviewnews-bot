@@ -14,7 +14,7 @@ from openai import OpenAI
 
 # ---------- Налаштування ----------
 FEEDS = [
-    "https://www.rbc.ua/static/rss/newsline.img.ukr.rss.xml",
+    "https://www.pravda.com.ua/rss/view_news/",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
@@ -28,6 +28,7 @@ MAX_POSTS = int(os.environ.get("MAX_POSTS", "30"))     # скільки нови
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
 MIN_QUOTE_LEN = int(os.environ.get("MIN_QUOTE_LEN", "15"))  # коротші фрази в лапках не вважаємо цитатами
+MARK_SEEN_ONLY = os.environ.get("MARK_SEEN_ONLY", "").strip().lower() == "true"  # лише запам'ятати поточні новини
 MIN_TEXT = 120                                         # мінімальна довжина тексту новини
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -908,6 +909,19 @@ def main():
     started = time.time()
     seen = load_seen()
     done = 0
+
+    if MARK_SEEN_ONLY:
+        # Службовий режим: позначаємо всі поточні новини зі стрічок як оброблені,
+        # нічого не публікуючи (щоб не з'являлися дублі).
+        added = 0
+        for entry in collect_entries():
+            link = entry.get("link")
+            if link and link not in seen:
+                seen.append(link)
+                added += 1
+        save_seen(seen)
+        print(f"Позначено як оброблені: {added} новин. Нічого не опубліковано.")
+        return
 
     for entry in collect_entries():
         if done >= MAX_POSTS:
