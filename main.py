@@ -14,7 +14,7 @@ from openai import OpenAI
 
 # ---------- Налаштування ----------
 FEEDS = [
-    "https://www.rbc.ua/static/rss/newsline.img.ukr.rss.xml",
+    "https://www.pravda.com.ua/rss/view_news/",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
