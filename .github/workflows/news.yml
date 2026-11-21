@@ -32,7 +32,7 @@ jobs:
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           POST_STATUS: publish   # publish = одразу на сайт, draft = у чернетки
-          MAX_POSTS: "3"         # скільки нових новин за один запуск
+          MAX_POSTS: "5"         # скільки нових новин за один запуск
         run: python main.py
 
       - name: Save list of processed news
