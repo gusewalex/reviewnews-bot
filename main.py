@@ -15,7 +15,6 @@ from openai import OpenAI
 # ---------- Налаштування ----------
 FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
-    "https://bukvy.org/feed/",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
