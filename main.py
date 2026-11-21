@@ -2,7 +2,7 @@ import json
 import os
 import re
 from html import escape
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
@@ -24,6 +24,7 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 POST_STATUS = os.environ.get("POST_STATUS", "draft")  # draft або publish
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "3"))      # скільки новин за один запуск
+MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 SEEN_FILE = "seen.json"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ReviewNewsBot/1.0)"}
@@ -215,6 +216,104 @@ def find_photo_caption(html_text, image_url):
     return None
 
 
+# ---------- Додаткові фото зі статті ----------
+SKIP_SRC = re.compile(
+    r"logo|icon|avatar|sprite|pixel|spacer|emoji|placeholder|blank|1x1|favicon|banner|/ads?/|\.svg",
+    re.I,
+)
+SKIP_CONTAINER = re.compile(
+    r"related|recommend|sidebar|comment|share|banner|widget|promo|advert"
+    r"|(?<![a-z])ads?(?![a-z])|newsletter|subscribe|popular|read-?also|also-?read|author|footer|menu",
+    re.I,
+)
+
+
+def _best_src(img):
+    """Адреса найбільшої версії картинки (враховує srcset і lazy-load)."""
+    srcset = img.get("srcset") or img.get("data-srcset")
+    if srcset:
+        best, best_w = None, -1
+        for part in srcset.split(","):
+            bits = part.strip().split()
+            if not bits:
+                continue
+            w = 0
+            if len(bits) > 1:
+                m = re.match(r"(\d+)", bits[1])
+                w = int(m.group(1)) if m else 0
+            if w > best_w:
+                best, best_w = bits[0], w
+        if best:
+            return best
+    for a in ("data-src", "data-lazy-src", "data-original", "src"):
+        v = img.get(a)
+        if v and not v.startswith("data:"):
+            return v
+    return None
+
+
+def _stem(url):
+    """Ім'я файлу без розширення й суфіксів розміру (щоб знаходити ту саму картинку)."""
+    name = url.split("?")[0].rstrip("/").split("/")[-1].lower()
+    name = re.sub(r"\.[a-z0-9]{2,5}$", "", name)
+    name = re.sub(r"[-_]\d+x\d+$", "", name)
+    name = re.sub(r"[-_](?:small|medium|large|big|thumb|orig|original|preview)$", "", name)
+    return name
+
+
+def find_article_images(html_text, page_url, exclude):
+    """Знаходить у тексті новини додаткові фото (без головного, логотипів,
+    реклами й блоків «читайте також»). Повертає список адрес."""
+    if not html_text:
+        return []
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        return []
+
+    scope = doc.xpath("//article")
+    root = scope[0] if scope else doc
+    skip_stems = {_stem(u) for u in exclude if u}
+    result = []
+
+    for img in root.iter("img"):
+        # занадто малі картинки (іконки, смайли)
+        if any(
+            (img.get(a) or "").isdigit() and int(img.get(a)) < 200
+            for a in ("width", "height")
+        ):
+            continue
+        src = _best_src(img)
+        if not src:
+            continue
+        url = urljoin(page_url, src)
+        if not url.startswith("http") or SKIP_SRC.search(url):
+            continue
+
+        # пропускаємо картинки з бокових блоків, реклами, схожих новин
+        bad = False
+        for anc in img.iterancestors():
+            if anc is root or not isinstance(anc.tag, str) or anc.tag in ("body", "html"):
+                break
+            if anc.tag in ("aside", "footer", "nav"):
+                bad = True
+                break
+            if SKIP_CONTAINER.search((anc.get("class") or "") + " " + (anc.get("id") or "")):
+                bad = True
+                break
+        if bad:
+            continue
+
+        st = _stem(url)
+        if not st or st in skip_stems:
+            continue
+        skip_stems.add(st)
+        result.append(url)
+        if len(result) >= MAX_IMAGES:
+            break
+    return result
+
+
 def entry_image(entry):
     for key in ("media_content", "media_thumbnail"):
         items = entry.get(key)
@@ -314,20 +413,38 @@ def upload_image(url):
         return None, None
 
 
-def add_image_to_content(content, image_url, caption, alt):
-    """Вставляє фото з підписом у текст статті, після першого абзацу."""
+def build_figure(image_url, caption, alt):
     figcaption = f"<figcaption>{escape(caption)}</figcaption>" if caption else ""
-    figure = (
+    return (
         '<figure class="wp-block-image size-large">'
         f'<img src="{escape(image_url)}" alt="{escape(alt)}"/>'
         f"{figcaption}"
         "</figure>"
     )
-    idx = content.find("</p>")
-    if idx == -1:
-        return figure + "\n" + content
-    idx += len("</p>")
-    return content[:idx] + "\n" + figure + "\n" + content[idx:]
+
+
+def insert_figures(content, figures):
+    """Розставляє фото по тексту: перше після 1-го абзацу, далі після 3-го,
+    5-го, 7-го... Якщо абзаців менше, решта йде в кінець статті."""
+    if not figures:
+        return content
+    parts = content.split("</p>")
+    paragraphs = [p + "</p>" for p in parts[:-1]]
+    tail = parts[-1]
+    if not paragraphs:
+        return "\n".join(figures) + "\n" + content
+
+    slots = [1, 3, 5, 7, 9, 11]
+    fig_at = {}
+    for i, fig in enumerate(figures):
+        n = slots[i] if i < len(slots) else len(paragraphs)
+        fig_at.setdefault(min(n, len(paragraphs)), []).append(fig)
+
+    out = []
+    for i, para in enumerate(paragraphs, 1):
+        out.append(para)
+        out.extend(fig_at.get(i, []))
+    return "\n".join(out) + tail
 
 
 def clean_tags(raw):
@@ -375,10 +492,10 @@ def get_tag_ids(names):
     return ids
 
 
-def create_post(data, image_id, image_url, caption, status, tag_ids=None):
-    content = data["content"]
-    if image_url:
-        content = add_image_to_content(content, image_url, caption, data["title"])
+def create_post(data, image_id, images, status, tag_ids=None):
+    """images: список (адреса фото на вашому сайті, підпис або None)."""
+    figures = [build_figure(u, c, data["title"]) for u, c in images]
+    content = insert_figures(data["content"], figures)
     payload = {
         "title": data["title"],
         "content": content,
@@ -433,19 +550,28 @@ def main():
                 continue
 
             data, status = rewrite_checked(entry.get("title", ""), text)
-            image_id, wp_image_url, caption = None, None, None
+            image_id, images = None, []
             img_url = image or entry_image(entry)
             if img_url:
-                image_id, wp_image_url = upload_image(img_url)
+                image_id, wp_url = upload_image(img_url)
                 caption = sanitize_caption(find_photo_caption(page_html, img_url))
-                print("Підпис до фото:", caption or "(не знайдено, без підпису)")
+                print("Підпис до головного фото:", caption or "(не знайдено, без підпису)")
+                if wp_url:
+                    images.append((wp_url, caption))
+
+            # додаткові фото зі статті
+            for extra in find_article_images(page_html, link, [img_url, image]):
+                _, wp_url = upload_image(extra)
+                if not wp_url:
+                    continue
+                cap = sanitize_caption(find_photo_caption(page_html, extra))
+                print("Додаткове фото:", extra, "| підпис:", cap or "(без підпису)")
+                images.append((wp_url, cap))
 
             tag_ids = get_tag_ids(data.get("tags"))
             print("Позначки:", clean_tags(data.get("tags")))
 
-            post_link = create_post(
-                data, image_id, wp_image_url, caption, status, tag_ids
-            )
+            post_link = create_post(data, image_id, images, status, tag_ids)
             print(f"Створено ({status}):", post_link)
             seen.append(link)
             done += 1
