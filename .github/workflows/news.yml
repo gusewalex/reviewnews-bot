@@ -15,6 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -32,10 +33,12 @@ jobs:
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           POST_STATUS: publish   # publish = одразу на сайт, draft = у чернетки
-          MAX_POSTS: "5"         # скільки нових новин за один запуск
+          MAX_POSTS: "30"        # скільки нових новин за один запуск
+          MAX_ENTRIES: "60"      # скільки останніх новин читати з кожної стрічки
         run: python main.py
 
       - name: Save list of processed news
+        if: always()             # зберігаємо список навіть якщо запуск завершився помилкою
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
