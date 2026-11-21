@@ -2,6 +2,8 @@ import calendar
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from html import escape
 from urllib.parse import urljoin, urlparse
@@ -28,6 +30,8 @@ MAX_POSTS = int(os.environ.get("MAX_POSTS", "30"))     # скільки нови
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
 MIN_QUOTE_LEN = int(os.environ.get("MIN_QUOTE_LEN", "15"))  # коротші фрази в лапках не вважаємо цитатами
+RUN_LOOP_MINUTES = int(os.environ.get("RUN_LOOP_MINUTES", "0") or 0)  # >0: працювати безперервно стільки хвилин
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "240") or 240)       # пауза між перевірками в режимі циклу
 MARK_SEEN_ONLY = os.environ.get("MARK_SEEN_ONLY", "").strip().lower() == "true"  # лише запам'ятати поточні новини
 MIN_TEXT = 40                                          # мінімальна довжина тексту новини
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
@@ -128,8 +132,9 @@ def get_article(url):
 
 # ---------- Підпис до фото (як у новині-першоджерелі) ----------
 CAPTION_HINT = re.compile(
-    r"caption|credit|photo-?(?:source|author|desc)|img-?(?:source|author|desc)"
-    r"|image-?(?:source|author|desc)|source-?photo",
+    r"caption|credit|descr|signature|підпис|подпис|author"
+    r"|photo[-_ ]?(?:source|author|desc|text|info)|img[-_ ]?(?:source|author|desc)"
+    r"|image[-_ ]?(?:source|author|desc)|source[-_ ]?photo",
     re.I,
 )
 CREDIT_RE = re.compile(
@@ -158,7 +163,6 @@ def _caption_from_text(t):
 SITE_NAMES = {
     "українська правда", "українську правду", "укрправда",
     "24 канал", "канал 24", "телеканал 24", "24tv", "pravda",
-    "рбк-україна", "рбк україна", "рбк", "rbc-ukraine", "rbc ukraine",
 }
 for _f in FEEDS:  # назви й домени джерел з FEEDS теж заборонені
     _host = urlparse(_f).netloc.lower().removeprefix("www.")
@@ -181,12 +185,24 @@ def is_site_part(text):
 def sanitize_caption(caption):
     """Прибирає з підпису сайти як джерела.
     'Фото: pravda.com.ua' -> None;
-    'Фото: Запорізька ОВА / pravda.com.ua' -> 'Фото: Запорізька ОВА'."""
+    'Фото: Запорізька ОВА / pravda.com.ua' -> 'Фото: Запорізька ОВА';
+    'наслідки атаки, фото ОВА' -> без змін;
+    'наслідки атаки, фото pravda.com.ua' -> 'наслідки атаки'."""
+    caption = _clean(caption)
     if not caption:
         return None
     prefix, sep, rest = caption.partition(":")
     if not sep:
-        return None if is_site_part(caption) else caption
+        if not is_site_part(caption):
+            return caption
+        names = "|".join(re.escape(n) for n in SITE_NAMES)
+        cleaned = re.sub(
+            r"[,.;]?\s*(?:ілюстративне\s+)?(?:фото|скріншот)\s*:?\s*[«\"]?(?:"
+            + DOMAIN_RE.pattern + "|" + names + r")[»\"]?",
+            "", caption, flags=re.I,
+        )
+        cleaned = _clean(cleaned).strip(" ,;.")
+        return None if (not cleaned or is_site_part(cleaned)) else cleaned
     rest2 = DOMAIN_RE.sub(" / ", rest)  # адреси й домени вирізаємо одразу
     parts = [x.strip() for x in re.split(r"\s*[/|;,]\s*", rest2) if x.strip()]
     good = [x for x in parts if not any(n in x.lower() for n in SITE_NAMES)]
@@ -201,28 +217,131 @@ CREDIT_START_RE = re.compile(
     r"^\s*(?:Ілюстративне фото|Фото з відкритих джерел|Фото|Фотограф|Photo|Credit)\s*[:：]",
     re.I,
 )
+# підпис, що закінчується вказівкою автора: «..., фото ОВА», «скріншот: X», «ілюстративне фото Getty Images»
+CAPTION_END_RE = re.compile(
+    r"(?:^|[,.;:—–(]\s+|[,.;:—–(])(?:ілюстративне\s+|архівне\s+)?"
+    r"(?:фото|скріншот|кадри?|відео|ілюстраці[яї]|світлина)(?=[\s:])\s*:?\s*"
+    r"(?-i:[A-ZА-ЯІЇЄҐ])[^.,]{0,45}\.?\s*\)?\s*$",
+    re.I,
+)
 INLINE_TAGS = {"span", "a", "b", "i", "em", "strong", "small", "br", "u", "font", "abbr", "time"}
+IMG_ATTRS = ("src", "data-src", "data-lazy-src", "srcset", "data-srcset")
 
 
 def _text(el):
     return _clean(" ".join(el.itertext()))
 
 
+def looks_like_caption(t):
+    """Короткий текст, схожий на підпис під фото (є вказівка «фото ...», «скріншот: ...»)."""
+    t = _clean(t)
+    if not t or len(t) > 250:
+        return False
+    return bool(CREDIT_START_RE.match(t) or CAPTION_END_RE.search(t))
+
+
 def _is_credit_el(el):
-    """Елемент, весь текст якого це підпис «Фото: ...» (без вкладених абзаців)."""
+    """Елемент, весь текст якого схожий на підпис (без вкладених абзаців)."""
     if not isinstance(el.tag, str) or el.tag in ("script", "style"):
         return None
     if any(not isinstance(ch.tag, str) or ch.tag not in INLINE_TAGS for ch in el):
         return None
     t = _text(el)
-    if t and len(t) <= 200 and CREDIT_START_RE.match(t):
-        return t
+    if not looks_like_caption(t):
+        return None
+    if el.tag == "p" and not CREDIT_START_RE.match(t):
+        return None  # звичайні абзаци не вважаємо підписами
+    return t
+
+
+def _structural_caption(img):
+    """Підпис, що за будовою сторінки належить саме цьому фото:
+    figcaption, блок з класом caption/descr..., або найменший контейнер
+    навколо фото з коротким текстом."""
+    node = img
+    for _ in range(5):
+        parent = node.getparent()
+        if parent is None or not isinstance(parent.tag, str):
+            break
+        if parent.tag in ("body", "html", "article", "main"):
+            break
+        if len(parent.xpath(".//img")) > 1:
+            break  # у блоці кілька фото: підпис неоднозначний
+        if parent.tag == "figure":
+            fc = parent.find(".//figcaption")
+            if fc is not None:
+                c = _caption_from_text(_text(fc))
+                if c:
+                    return c
+        for el in parent.iter():
+            if el is img or not isinstance(el.tag, str):
+                continue
+            cls = (el.get("class") or "") + " " + (el.get("id") or "")
+            if el.tag == "figcaption" or CAPTION_HINT.search(cls):
+                c = _caption_from_text(_text(el))
+                if c:
+                    return c
+        t = _text(parent)
+        if (
+            t
+            and len(t) <= 300
+            and not parent.xpath(".//p|.//h1|.//h2|.//h3|.//ul|.//ol")
+            and not re.fullmatch(r"[\d\s.:/,\-]+", t)  # лише дата/час: не підпис
+        ):
+            return t
+        node = parent
     return None
 
 
+def _sibling_caption(img):
+    """Короткий рядок «..., фото ОВА» одразу після фото (або після його обгортки)."""
+    node = img
+    for _ in range(3):
+        sib = node.getnext()
+        while sib is not None and not isinstance(sib.tag, str):
+            sib = sib.getnext()
+        if (
+            sib is not None
+            and sib.tag not in ("script", "style", "img", "picture", "figure")
+            and not sib.xpath(".//img")
+        ):
+            t = _text(sib)
+            if looks_like_caption(t):
+                return t
+        node = node.getparent()
+        if node is None or not isinstance(node.tag, str) or node.tag in ("body", "html", "article", "main"):
+            break
+    return None
+
+
+def _matching_imgs(doc, image_url):
+    name = (image_url or "").split("?")[0].rstrip("/").split("/")[-1]
+    if len(name) < 5:
+        return []
+    return [
+        img for img in doc.iter("img")
+        if name in " ".join(img.get(a) or "" for a in IMG_ATTRS)
+    ]
+
+
+def debug_image_context(html_text, image_url):
+    """Фрагмент HTML навколо фото (для діагностики, коли підпис не знайдено)."""
+    try:
+        doc = lxml_html.fromstring(html_text)
+        imgs = _matching_imgs(doc, image_url)
+        if not imgs:
+            return "(зображення на сторінці не знайдено за назвою файлу)"
+        node = imgs[0].getparent()
+        if node is not None and node.getparent() is not None and len(_text(node)) < 5:
+            node = node.getparent()
+        return lxml_html.tostring(node, encoding="unicode")[:900]
+    except Exception as e:
+        return f"(не вдалося: {e})"
+
+
 def find_photo_caption(html_text, image_url, is_main=False):
-    """Шукає на сторінці новини підпис до фото (наприклад, 'Фото: Getty Images').
-    Повертає текст підпису або None."""
+    """Шукає на сторінці новини підпис до фото так, як він написаний на сайті
+    (наприклад: «наслідки атаки, фото ОВА» чи «Фото: Getty Images»)."""
     if not html_text:
         return None
     try:
@@ -230,39 +349,21 @@ def find_photo_caption(html_text, image_url, is_main=False):
     except Exception:
         return None
 
-    # 1) Знаходимо саме це зображення й беремо підпис, що стоїть біля нього
-    target = None
-    name = (image_url or "").split("?")[0].rstrip("/").split("/")[-1]
-    if len(name) >= 5:
-        for img in doc.iter("img"):
-            attrs = " ".join(
-                img.get(a) or "" for a in ("src", "data-src", "data-lazy-src", "srcset", "data-srcset")
-            )
-            if name not in attrs:
-                continue
-            if target is None:
-                target = img
-            node = img
-            for _ in range(4):  # піднімаємось на кілька рівнів угору
-                node = node.getparent()
-                if node is None or len(node.xpath(".//img")) > 1:
-                    break  # у блоці кілька фото: підпис неоднозначний
-                if node.tag == "figure":
-                    fc = node.find(".//figcaption")
-                    if fc is not None:
-                        c = _caption_from_text(_text(fc))
-                        if c:
-                            return c
-                for el in node.iter():
-                    if el is img or not isinstance(el.tag, str):
-                        continue
-                    cls = (el.get("class") or "") + " " + (el.get("id") or "")
-                    if el.tag == "figcaption" or CAPTION_HINT.search(cls):
-                        c = _caption_from_text(_text(el))
-                        if c:
-                            return c
+    imgs = _matching_imgs(doc, image_url)
+    target = imgs[0] if imgs else None
 
-    # 2) Найближчий до фото елемент «Фото: ...» (зазвичай одразу під фото)
+    # 1) Підпис, що за будовою сторінки належить цьому фото
+    for img in imgs:
+        c = _structural_caption(img)
+        if c:
+            return c
+    # 2) Рядок із вказівкою «фото ...» одразу після фото
+    if target is not None:
+        c = _sibling_caption(target)
+        if c:
+            return c
+
+    # 3) Найближчий до фото елемент-підпис
     elements = [
         el for el in doc.iter() if isinstance(el.tag, str) and el.tag not in ("script", "style")
     ]
@@ -289,7 +390,7 @@ def find_photo_caption(html_text, image_url, is_main=False):
         if best:
             return best[1]
 
-    # 3) Для головного фото: перший підпис «Фото: ...» у статті
+    # 4) Для головного фото: перший підпис у статті
     if is_main and credits:
         scope = doc.xpath("//article")
         if scope:
@@ -1060,58 +1161,29 @@ def entry_date_gmt(entry):
         return None
 
 
-def build_manual_entry(url):
-    """Готує запис для обробки одного URL, надісланого через Telegram."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
-        raise ValueError("Потрібне коректне публічне HTTP(S)-посилання.")
-
-    text, image, page_html = get_article(url)
-    meta = trafilatura.extract_metadata(page_html)
-    title = (meta.title or "").strip() if meta else ""
-
-    if not title:
-        try:
-            doc = lxml_html.fromstring(page_html)
-            title_nodes = doc.xpath("//meta[@property='og:title']/@content | //meta[@name='twitter:title']/@content | //title/text()")
-            title = _clean(title_nodes[0]) if title_nodes else ""
-        except Exception:
-            title = ""
-
-    if not title:
-        title = parsed.path.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ") or parsed.hostname
-
-    return {
-        "link": url,
-        "title": title,
-        "summary": text,
-        "_article_data": (text, image, page_html),
-        "_manual": True,
-    }
+def mark_seen_only():
+    """Службовий режим: позначаємо всі поточні новини зі стрічок як оброблені,
+    нічого не публікуючи (щоб не з'являлися дублі)."""
+    seen = load_seen()
+    added = 0
+    for entry in collect_entries():
+        link = entry.get("link")
+        if link and link not in seen:
+            seen.append(link)
+            added += 1
+    save_seen(seen)
+    print(f"Позначено як оброблені: {added} новин. Нічого не опубліковано.")
 
 
-def main():
+def run_once():
+    """Одна перевірка стрічок: нові новини переписуються й публікуються."""
     started = time.time()
     seen = load_seen()
     done = 0
-    manual_url = os.environ.get("ARTICLE_URL", "").strip()
-
-    if MARK_SEEN_ONLY:
-        # Службовий режим: позначаємо всі поточні новини зі стрічок як оброблені,
-        # нічого не публікуючи (щоб не з'являлися дублі).
-        added = 0
-        for entry in collect_entries():
-            link = entry.get("link")
-            if link and link not in seen:
-                seen.append(link)
-                added += 1
-        save_seen(seen)
-        print(f"Позначено як оброблені: {added} новин. Нічого не опубліковано.")
-        return
+    FEED_REPORT.clear()
 
     n_seen, n_short, errors = 0, 0, []
-    entries = [build_manual_entry(manual_url)] if manual_url else collect_entries()
-    for entry in entries:
+    for entry in collect_entries():
         if done >= MAX_POSTS:
             break
         if time.time() - started > MAX_RUN_SECONDS:
@@ -1126,15 +1198,12 @@ def main():
 
         try:
             page_ok = True
-            if entry.get("_article_data"):
-                text, image, page_html = entry["_article_data"]
-            else:
-                try:
-                    text, image, page_html = get_article(link)
-                except Exception as e:
-                    page_ok = False
-                    print("Сторінку не відкрито, беру текст з RSS:", link, "->", e)
-                    text, image, page_html = "", None, ""
+            try:
+                text, image, page_html = get_article(link)
+            except Exception as e:
+                page_ok = False
+                print("Сторінку не відкрито, беру текст з RSS:", link, "->", e)
+                text, image, page_html = "", None, ""
 
             if len(text) < 300:  # якщо зі сторінки текст не витягнувся, беремо з RSS
                 alt = rss_text(entry)
@@ -1145,8 +1214,6 @@ def main():
             if len(text) < MIN_TEXT:
                 print("Занадто короткий текст, пропускаю:", link)
                 n_short += 1
-                if entry.get("_manual"):
-                    raise ValueError("Не вдалося отримати достатньо тексту зі сторінки.")
                 seen.append(link)
                 save_seen(seen)
                 continue
@@ -1171,6 +1238,8 @@ def main():
                     "Підпис до головного фото:",
                     f"{caption} (знайдено: {cap_src})" if caption else f"(підпису на сайті-джерелі не знайдено, фото без підпису: {link})",
                 )
+                if not caption and page_html:
+                    print("ДІАГНОСТИКА, HTML навколо фото:", debug_image_context(page_html, img_url))
                 if wp_url:
                     images.append((wp_url, caption))
 
@@ -1200,8 +1269,32 @@ def main():
     save_seen(seen)
     print(f"Готово. Нових матеріалів: {done}")
     write_summary(done, n_seen, n_short, errors)
-    if manual_url and errors:
-        raise RuntimeError(errors[0])
+
+
+def commit_state():
+    """У GitHub Actions: зберігаємо seen.json у репозиторії між перевірками."""
+    if os.environ.get("GITHUB_ACTIONS") and os.path.exists("save_seen.py"):
+        try:
+            subprocess.run([sys.executable, "save_seen.py"], timeout=180)
+        except Exception as e:
+            print("Не вдалося зберегти список оброблених новин:", e)
+
+
+def main():
+    if MARK_SEEN_ONLY:
+        mark_seen_only()
+        return
+    start = time.time()
+    while True:
+        run_once()
+        if RUN_LOOP_MINUTES <= 0:
+            break
+        commit_state()
+        remaining = RUN_LOOP_MINUTES * 60 - (time.time() - start)
+        if remaining < POLL_SECONDS + 120:
+            break
+        print(f"Наступна перевірка через {POLL_SECONDS // 60} хв...")
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
