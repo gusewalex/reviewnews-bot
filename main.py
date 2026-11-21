@@ -29,11 +29,19 @@ MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки оста
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
 MIN_QUOTE_LEN = int(os.environ.get("MIN_QUOTE_LEN", "15"))  # коротші фрази в лапках не вважаємо цитатами
 MARK_SEEN_ONLY = os.environ.get("MARK_SEEN_ONLY", "").strip().lower() == "true"  # лише запам'ятати поточні новини
-MIN_TEXT = 120                                         # мінімальна довжина тексту новини
+MIN_TEXT = 40                                          # мінімальна довжина тексту новини
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 SEEN_FILE = "seen.json"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ReviewNewsBot/1.0)"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
+}
+FEED_REPORT = []  # (адреса стрічки, статус, кількість новин): для підсумку запуску
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 auth = (WP_USER, WP_APP_PASSWORD)
@@ -100,7 +108,9 @@ def save_seen(seen):
 
 def get_article(url):
     """Повертає (текст, посилання на картинку, HTML сторінки)."""
-    html = requests.get(url, headers=HEADERS, timeout=30).text
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()  # 403/503 тощо: сайт блокує бота, тоді беремо текст з RSS
+    html = r.text
     text = trafilatura.extract(html) or ""
     meta = trafilatura.extract_metadata(html)
     image = meta.image if meta and meta.image else None
@@ -862,17 +872,35 @@ def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None):
     return resp.json().get("link")
 
 
+def fetch_feed(feed_url):
+    """Читає RSS-стрічку. Повертає (список новин, статус для звіту)."""
+    entries, status = [], "?"
+    try:
+        r = requests.get(feed_url, headers=HEADERS, timeout=30)
+        status = f"HTTP {r.status_code}"
+        if r.status_code == 200:
+            entries = list(feedparser.parse(r.content).entries)
+    except Exception as e:
+        status = f"помилка: {e}"
+    if not entries:  # запасний спосіб читання
+        try:
+            entries = list(feedparser.parse(feed_url, agent=HEADERS["User-Agent"]).entries)
+        except Exception:
+            pass
+    return entries, status
+
+
 def collect_entries():
     """Збирає новини з усіх джерел, чергуючи їх (по одній з кожного),
     щоб одне джерело не займало весь ліміт за запуск."""
     per_feed = []
     for feed_url in FEEDS:
-        try:
-            feed = feedparser.parse(feed_url, agent=HEADERS["User-Agent"])
-            per_feed.append(list(feed.entries[:MAX_ENTRIES]))
-            print(f"{feed_url}: знайдено {len(feed.entries)} новин")
-        except Exception as e:
-            print("Не вдалося прочитати стрічку", feed_url, "->", e)
+        entries, status = fetch_feed(feed_url)
+        FEED_REPORT.append((feed_url, status, len(entries)))
+        print(f"{feed_url}: {status}, новин у стрічці: {len(entries)}")
+        if not entries:
+            print("ПРОБЛЕМА: стрічка порожня або недоступна (можливо, сайт блокує запити з GitHub)")
+        per_feed.append(entries[:MAX_ENTRIES])
 
     mixed = []
     for i in range(MAX_ENTRIES):
@@ -880,6 +908,24 @@ def collect_entries():
             if i < len(entries):
                 mixed.append(entries[i])
     return mixed
+
+
+def write_summary(done, n_seen, n_short, errors):
+    """Короткий підсумок запуску на сторінці запуску в GitHub Actions."""
+    lines = ["### Підсумок запуску", f"- Опубліковано: **{done}**"]
+    for url, status, n in FEED_REPORT:
+        lines.append(f"- Стрічка `{url}`: {status}, новин: {n}")
+    lines.append(f"- Вже оброблених пропущено: {n_seen}; занадто коротких: {n_short}")
+    if errors:
+        lines.append(f"- Помилок: **{len(errors)}**. Перша: `{errors[0][:300]}`")
+    if FEED_REPORT and all(n == 0 for _u, _s, n in FEED_REPORT):
+        lines.append("- **ПРОБЛЕМА:** жодна стрічка не віддала новин (сайт блокує запити або стрічка змінилась)")
+    text = "\n".join(lines)
+    print(text)
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
 
 
 def rss_text(entry):
@@ -924,6 +970,7 @@ def main():
         print(f"Позначено як оброблені: {added} новин. Нічого не опубліковано.")
         return
 
+    n_seen, n_short, errors = 0, 0, []
     for entry in collect_entries():
         if done >= MAX_POSTS:
             break
@@ -931,7 +978,10 @@ def main():
             print("Час запуску вичерпано, решту новин оброблю наступного разу")
             break
         link = entry.get("link")
-        if not link or link in seen:
+        if not link:
+            continue
+        if link in seen:
+            n_seen += 1
             continue
 
         try:
@@ -947,11 +997,13 @@ def main():
                 alt = rss_text(entry)
                 if len(alt) > len(text):
                     text = alt
+            if len(text) < MIN_TEXT:  # дуже короткий текст: додаємо заголовок новини
+                text = (entry.get("title", "") + ". " + text).strip(" .")
             if len(text) < MIN_TEXT:
                 print("Занадто короткий текст, пропускаю:", link)
-                if page_ok:
-                    seen.append(link)
-                    save_seen(seen)
+                n_short += 1
+                seen.append(link)
+                save_seen(seen)
                 continue
 
             links = find_source_links(page_html, link) if page_ok else []
@@ -998,9 +1050,11 @@ def main():
             done += 1
         except Exception as e:
             print("Помилка з новиною", link, "->", e)
+            errors.append(f"{link} -> {e}")
 
     save_seen(seen)
     print(f"Готово. Нових матеріалів: {done}")
+    write_summary(done, n_seen, n_short, errors)
 
 
 if __name__ == "__main__":
