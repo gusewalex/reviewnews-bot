@@ -15,6 +15,7 @@ from openai import OpenAI
 # ---------- Налаштування ----------
 FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
+    "https://24tv.ua/rss/all.xml?googleFlg=true&tagId=1117",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
@@ -23,11 +24,11 @@ WP_USER = os.environ["WP_USER"]
 WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-POST_STATUS = os.environ.get("POST_STATUS", "publish")  # draft або publish
+POST_STATUS = os.environ.get("POST_STATUS", "publish")  # publish або draft
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "30"))     # скільки новин за один запуск
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
-MIN_QUOTE_LEN = int(os.environ.get("MIN_QUOTE_LEN", "40"))  # коротші фрази в лапках не вважаємо цитатами
+MIN_QUOTE_LEN = int(os.environ.get("MIN_QUOTE_LEN", "15"))  # коротші фрази в лапках не вважаємо цитатами
 MIN_TEXT = 120                                         # мінімальна довжина тексту новини
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -49,9 +50,11 @@ PROMPT = """Ти досвідчений редактор українськог�
    так, як в оригіналі (з тими самими відмінками, написанням і транслітерацією).
    Не скорочуй і не «покращуй» їх.
 3. Цифри, дати, суми, відсотки, час: переноси без змін.
-4. Прямі цитати (текст у лапках «...» або "..."): копіюй дослівно, символ
-   у символ, не перефразовуй і не скорочуй. Обов'язково вказуй, хто це сказав.
-   Непрямі висловлювання перефразовуй вільно.
+4. Прямі цитати в оригіналі замінені маркерами [[Q1]], [[Q2]] тощо.
+   Кожен маркер ОБОВ'ЯЗКОВО має бути в тексті новини рівно в такому вигляді,
+   без змін (лапки вже входять у маркер, власних лапок навколо не додавай).
+   Поруч із маркером вкажи, хто це сказав. Саму цитату не пиши і не
+   перефразовуй, лише маркер. Непрямі висловлювання перефразовуй вільно.
 5. Не змінюй суть: не посилюй і не пом'якшуй твердження, не перетворюй
    «заявив» на «підтвердив» чи «вважає» на «стверджує».
 6. Стиль: нейтральний, діловий, без епітетів, оцінок і клікбейту.
@@ -623,26 +626,88 @@ def add_target_blank(content):
     return re.sub(r"<a\s+(?![^>]*\btarget=)", '<a target="_blank" rel="noopener" ', content, flags=re.I)
 
 
+# ---------- Дослівні цитати: підставляємо оригінал у готовий текст ----------
+QUOTE_SUB_RE = re.compile(
+    r"«([^»\n]{%d,600})»|„([^“”\n]{%d,600})[“”]|“([^”\n]{%d,600})”|\"([^\"\n]{%d,600})\""
+    % (MIN_QUOTE_LEN, MIN_QUOTE_LEN, MIN_QUOTE_LEN, MIN_QUOTE_LEN)
+)
+MARK_RE = re.compile(r"\[\[\s*Q(\d+)\s*\]\]", re.I)
+WRAPPED_MARK_RE = re.compile(r"[«„“\"]\s*(\[\[\s*Q\d+\s*\]\])\s*[»“”\"]", re.I)
+
+
+def mask_quotes(text):
+    """Замінює прямі цитати маркерами [[Q1]], [[Q2]]...
+    Повертає (текст з маркерами, список оригінальних цитат разом з лапками)."""
+    quotes = []
+
+    def repl(m):
+        quotes.append(m.group(0))
+        return f"[[Q{len(quotes)}]]"
+
+    return QUOTE_SUB_RE.sub(repl, text), quotes
+
+
+def unmask_quotes(content, quotes):
+    """Підставляє замість маркерів точні оригінальні цитати.
+    Повертає (текст, множина використаних номерів)."""
+    content = WRAPPED_MARK_RE.sub(r"\1", content)  # GPT міг додати лапки навколо маркера
+    used = set()
+
+    def repl(m):
+        i = int(m.group(1))
+        if 1 <= i <= len(quotes):
+            used.add(i)
+            return escape(quotes[i - 1], quote=False)
+        return ""
+
+    return MARK_RE.sub(repl, content), used
+
+
+def sentence_with(text, quote):
+    """Речення з оригіналу, в якому стоїть цитата (разом з тим, хто її сказав)."""
+    i = text.find(quote)
+    if i < 0:
+        return quote
+    start = max(text.rfind(". ", 0, i), text.rfind("\n", 0, i)) + 1
+    ends = [e for e in (text.find(". ", i + len(quote)), text.find("\n", i + len(quote))) if e != -1]
+    end = min(ends) + 1 if ends else len(text)
+    return text[start:end].strip()[:700]
+
+
 def rewrite_checked(title, text, links=None):
-    """Переписує новину; перевіряє, що прямі цитати збережені дослівно
-    і що збережено посилання на джерела. Повертає (дані, статус_публікації)."""
+    """Переписує новину. Прямі цитати та посилання на джерела гарантовано
+    переносяться з оригіналу без змін. Повертає (дані, статус_публікації)."""
     links = links or []
     text = strip_noise(text)  # прибираємо «читайте також» тощо до переписування
+    masked, quotes = mask_quotes(text)  # цитати йдуть до GPT як маркери
     notes = format_links(links)
+    if quotes:
+        notes += (
+            "\n\nПрямі цитати в тексті замінено маркерами "
+            + ", ".join(f"[[Q{i}]]" for i in range(1, len(quotes) + 1))
+            + ". Використай кожен маркер у новині точно як є."
+        )
 
-    data = rewrite(title, text, notes)
-    data["content"] = clean_links(data["content"], links)
-    miss_q = missing_quotes(text, data["content"])
+    def attempt(extra):
+        d = rewrite(title, masked, extra)
+        content, used = unmask_quotes(d["content"], quotes)
+        d["content"] = clean_links(content, links)
+        for k in ("title", "excerpt"):
+            d[k] = MARK_RE.sub("", d.get(k) or "").strip()
+        return d, used
+
+    data, used = attempt(notes)
+    miss_q = [i for i in range(1, len(quotes) + 1) if i not in used]
     miss_l = missing_links(links, data["content"])
 
     if miss_q or miss_l:
         extra = notes
         if miss_q:
-            print("Цитати змінено, пробую ще раз:", miss_q)
+            print("Не використано цитати, пробую ще раз:", [f"Q{i}" for i in miss_q])
             extra += (
-                "\n\nУ попередній спробі ці прямі цитати були змінені. "
-                "Вони мають бути в тексті ДОСЛІВНО, без жодних змін:\n- "
-                + "\n- ".join(miss_q)
+                "\n\nУ попередній спробі не було використано маркери: "
+                + ", ".join(f"[[Q{i}]]" for i in miss_q)
+                + ". Кожен маркер має бути в тексті обов'язково, поруч із тим, хто це сказав."
             )
         if miss_l:
             print("Втрачено посилання, пробую ще раз:", [l["url"] for l in miss_l])
@@ -651,20 +716,22 @@ def rewrite_checked(title, text, links=None):
                 "обов'язково як <a href=...> на відповідному слові:\n- "
                 + "\n- ".join(f"«{l['anchor']}» → {l['url']}" for l in miss_l)
             )
-        data = rewrite(title, text, extra)
-        data["content"] = clean_links(data["content"], links)
-        miss_q = missing_quotes(text, data["content"])
+        data, used = attempt(extra)
+        miss_q = [i for i in range(1, len(quotes) + 1) if i not in used]
         miss_l = missing_links(links, data["content"])
 
-    if miss_l:  # гарантуємо, що посилання не втрачені
+    if miss_q:  # гарантія: цитата не втрачається, додаємо її речення з оригіналу дослівно
+        added = []
+        for i in miss_q:
+            sent = sentence_with(text, quotes[i - 1])
+            if sent not in added:
+                added.append(sent)
+        print("Цитати додано дослівно з оригіналу:", len(miss_q))
+        data["content"] += "".join(f"\n<p>{escape(x, quote=False)}</p>" for x in added)
+    if miss_l:  # гарантія: посилання не втрачаються
         print("Посилання додано в кінець статті:", [l["url"] for l in miss_l])
         data["content"] = append_missing_links(data["content"], miss_l)
     data["content"] = add_target_blank(data["content"])
-
-    if miss_q:
-        # Не вдалося зберегти цитати: залишаємо як чернетку для ручної перевірки
-        print("Цитати все ще не збігаються, зберігаю як чернетку:", miss_q)
-        return data, "draft"
     return data, POST_STATUS
 
 
