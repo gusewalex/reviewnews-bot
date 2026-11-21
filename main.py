@@ -1,6 +1,8 @@
+import calendar
 import json
 import os
 import re
+import time
 from html import escape
 from urllib.parse import urljoin, urlparse
 
@@ -23,7 +25,10 @@ WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 POST_STATUS = os.environ.get("POST_STATUS", "draft")  # draft або publish
-MAX_POSTS = int(os.environ.get("MAX_POSTS", "5"))      # скільки новин за один запуск
+MAX_POSTS = int(os.environ.get("MAX_POSTS", "30"))     # скільки новин за один запуск
+MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
+MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
+MIN_TEXT = 120                                         # мінімальна довжина тексту новини
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 SEEN_FILE = "seen.json"
@@ -52,8 +57,9 @@ PROMPT = """Ти досвідчений редактор українськог�
 6. Стиль: нейтральний, діловий, без епітетів, оцінок і клікбейту.
    Перша фраза відповідає на питання «що сталося?». Найважливіше на початку.
 7. Структура: змінюй порядок подачі й формулювання, не копіюй речення
-   з оригіналу (крім цитат). Обсяг орієнтовно такий самий, як в оригіналі,
-   але не менше 3 абзаців.
+   з оригіналу (крім цитат). Обсяг орієнтовно такий самий, як в оригіналі.
+   Якщо оригінал короткий, не розтягуй його і нічого не додавай:
+   кількість абзаців від 1 до 6 залежно від обсягу.
 8. Прибери з тексту рекламу, заклики підписатися, фрази на кшталт
    «читайте також» та підписи фотографів.
 9. Позначки (хештеги): визнач 3 найважливіші позначки за змістом новини.
@@ -413,8 +419,12 @@ def upload_image(url):
         return None, None
 
 
+DEFAULT_CAPTION = "Фото з відкритих джерел"  # якщо в джерелі підпису немає
+
+
 def build_figure(image_url, caption, alt):
-    figcaption = f"<figcaption>{escape(caption)}</figcaption>" if caption else ""
+    caption = caption or DEFAULT_CAPTION  # підпис є завжди
+    figcaption = f"<figcaption>{escape(caption)}</figcaption>"
     return (
         '<figure class="wp-block-image size-large">'
         f'<img src="{escape(image_url)}" alt="{escape(alt)}"/>'
@@ -492,7 +502,7 @@ def get_tag_ids(names):
     return ids
 
 
-def create_post(data, image_id, images, status, tag_ids=None):
+def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None):
     """images: список (адреса фото на вашому сайті, підпис або None)."""
     figures = [build_figure(u, c, data["title"]) for u, c in images]
     content = insert_figures(data["content"], figures)
@@ -506,6 +516,8 @@ def create_post(data, image_id, images, status, tag_ids=None):
         payload["featured_media"] = image_id
     if tag_ids:
         payload["tags"] = tag_ids
+    if date_gmt:
+        payload["date_gmt"] = date_gmt  # час публікації як у джерела
     resp = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", auth=auth, json=payload, timeout=60)
     resp.raise_for_status()
     return resp.json().get("link")
@@ -518,44 +530,86 @@ def collect_entries():
     for feed_url in FEEDS:
         try:
             feed = feedparser.parse(feed_url, agent=HEADERS["User-Agent"])
-            per_feed.append(list(feed.entries[:15]))
+            per_feed.append(list(feed.entries[:MAX_ENTRIES]))
             print(f"{feed_url}: знайдено {len(feed.entries)} новин")
         except Exception as e:
             print("Не вдалося прочитати стрічку", feed_url, "->", e)
 
     mixed = []
-    for i in range(15):
+    for i in range(MAX_ENTRIES):
         for entries in per_feed:
             if i < len(entries):
                 mixed.append(entries[i])
     return mixed
 
 
+def rss_text(entry):
+    """Короткий текст новини з самої RSS-стрічки (запасний варіант)."""
+    raw = entry.get("summary") or entry.get("description") or ""
+    if not raw:
+        return ""
+    try:
+        return _clean(lxml_html.fromstring("<div>" + raw + "</div>").text_content())
+    except Exception:
+        return _clean(re.sub(r"<[^>]+>", " ", raw))
+
+
+def entry_date_gmt(entry):
+    """Час публікації новини в джерелі (UTC) або None."""
+    pub = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not pub:
+        return None
+    try:
+        if calendar.timegm(pub) > time.time():  # дата з майбутнього: ігноруємо
+            return None
+        return time.strftime("%Y-%m-%dT%H:%M:%S", pub)
+    except Exception:
+        return None
+
+
 def main():
+    started = time.time()
     seen = load_seen()
     done = 0
 
     for entry in collect_entries():
         if done >= MAX_POSTS:
             break
+        if time.time() - started > MAX_RUN_SECONDS:
+            print("Час запуску вичерпано, решту новин оброблю наступного разу")
+            break
         link = entry.get("link")
         if not link or link in seen:
             continue
 
         try:
-            text, image, page_html = get_article(link)
-            if len(text) < 300:
+            page_ok = True
+            try:
+                text, image, page_html = get_article(link)
+            except Exception as e:
+                page_ok = False
+                print("Сторінку не відкрито, беру текст з RSS:", link, "->", e)
+                text, image, page_html = "", None, ""
+
+            if len(text) < 300:  # якщо зі сторінки текст не витягнувся, беремо з RSS
+                alt = rss_text(entry)
+                if len(alt) > len(text):
+                    text = alt
+            if len(text) < MIN_TEXT:
                 print("Занадто короткий текст, пропускаю:", link)
-                seen.append(link)
+                if page_ok:
+                    seen.append(link)
+                    save_seen(seen)
                 continue
 
             data, status = rewrite_checked(entry.get("title", ""), text)
+
             image_id, images = None, []
             img_url = image or entry_image(entry)
             if img_url:
                 image_id, wp_url = upload_image(img_url)
                 caption = sanitize_caption(find_photo_caption(page_html, img_url))
-                print("Підпис до головного фото:", caption or "(не знайдено, без підпису)")
+                print("Підпис до головного фото:", caption or f"({DEFAULT_CAPTION})")
                 if wp_url:
                     images.append((wp_url, caption))
 
@@ -565,15 +619,18 @@ def main():
                 if not wp_url:
                     continue
                 cap = sanitize_caption(find_photo_caption(page_html, extra))
-                print("Додаткове фото:", extra, "| підпис:", cap or "(без підпису)")
+                print("Додаткове фото:", extra, "| підпис:", cap or f"({DEFAULT_CAPTION})")
                 images.append((wp_url, cap))
 
             tag_ids = get_tag_ids(data.get("tags"))
             print("Позначки:", clean_tags(data.get("tags")))
 
-            post_link = create_post(data, image_id, images, status, tag_ids)
+            post_link = create_post(
+                data, image_id, images, status, tag_ids, entry_date_gmt(entry)
+            )
             print(f"Створено ({status}):", post_link)
             seen.append(link)
+            save_seen(seen)  # зберігаємо одразу, щоб не було дублів при збої
             done += 1
         except Exception as e:
             print("Помилка з новиною", link, "->", e)
