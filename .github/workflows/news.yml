@@ -31,7 +31,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Process Telegram links
+        if: ${{ !inputs.mark_only }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POST_STATUS: publish
+          MAX_IMAGES: "4"
+        run: python telegram_poll.py
+        continue-on-error: true
+
+      - name: Run RSS bot
         env:
           WP_URL: ${{ secrets.WP_URL }}
           WP_USER: ${{ secrets.WP_USER }}
@@ -49,6 +63,7 @@ jobs:
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
           cp seen.json /tmp/mine.json 2>/dev/null || echo "[]" > /tmp/mine.json
+          cp telegram_offset.json /tmp/telegram_offset.json 2>/dev/null || echo '{"offset": 0}' > /tmp/telegram_offset.json
           for i in 1 2 3 4 5; do
             git fetch origin main
             git reset --hard origin/main
@@ -65,8 +80,19 @@ jobs:
           merged = list(dict.fromkeys(load("seen.json") + load("/tmp/mine.json")))[-2000:]
           with open("seen.json", "w", encoding="utf-8") as f:
               json.dump(merged, f, ensure_ascii=False, indent=1)
+
+          def load_offset(path):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return int(json.load(f).get("offset", 0))
+              except Exception:
+                  return 0
+
+          offset = max(load_offset("telegram_offset.json"), load_offset("/tmp/telegram_offset.json"))
+          with open("telegram_offset.json", "w", encoding="utf-8") as f:
+              json.dump({"offset": offset}, f, ensure_ascii=False, indent=2)
           PY
-            git add seen.json
+            git add seen.json telegram_offset.json
             if git diff --staged --quiet; then
               break
             fi
