@@ -4,7 +4,7 @@ import os
 import re
 import time
 from html import escape
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
@@ -103,55 +103,16 @@ PROMPT = """Ти досвідчений редактор українськог�
 """
 
 
-def normalize_url(url):
-    """Нормалізує URL лише для дедуплікації, не змінюючи URL публікації."""
-    if not url:
-        return ""
-    try:
-        parsed = urlparse(str(url).strip())
-        host = (parsed.hostname or "").lower()
-        if not host:
-            return str(url).strip()
-        if host.startswith("www."):
-            host = host[4:]
-        port = f":{parsed.port}" if parsed.port else ""
-        netloc = host + port
-        # Відкидаємо лише типові рекламні/аналітичні параметри.
-        tracking = {"fbclid", "gclid", "yclid", "_ga", "mc_cid", "mc_eid"}
-        query = [
-            (key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-            if not key.lower().startswith("utm_") and key.lower() not in tracking
-        ]
-        path = parsed.path.rstrip("/") or "/"
-        return urlunparse((parsed.scheme.lower() or "https", netloc, path, "", urlencode(sorted(query)), ""))
-    except Exception:
-        return str(url).strip()
-
-
 def load_seen():
-    """Читає старий seen.json і захищає запуск від пошкодженого файлу."""
-    if not os.path.exists(SEEN_FILE):
-        return []
-    try:
+    if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, str) and item.strip()]
-        raise RuntimeError("seen.json має бути списком URL. Публікацію зупинено, щоб не створити дублікати.")
-    except Exception as e:
-        raise RuntimeError(f"Не вдалося прочитати seen.json; публікацію зупинено для захисту від дублів: {e}") from e
+            return json.load(f)
+    return []
 
 
 def save_seen(seen):
-    """Зберігає до 2000 унікальних URL, сумісно зі старим форматом seen.json."""
-    unique, keys = [], set()
-    for url in seen:
-        key = normalize_url(url)
-        if key and key not in keys:
-            keys.add(key)
-            unique.append(url)
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(unique[-2000:], f, ensure_ascii=False, indent=1)
+        json.dump(seen[-2000:], f, ensure_ascii=False, indent=1)
 
 
 def get_article(url):
@@ -1057,12 +1018,12 @@ def collect_entries():
     return mixed
 
 
-def write_summary(done, n_seen, n_new, n_short, errors):
+def write_summary(done, n_seen, n_short, errors):
     """Короткий підсумок запуску на сторінці запуску в GitHub Actions."""
     lines = ["### Підсумок запуску", f"- Опубліковано: **{done}**"]
     for url, status, n in FEED_REPORT:
         lines.append(f"- Стрічка `{url}`: {status}, новин: {n}")
-    lines.append(f"- Нових посилань у доступних RSS: {n_new}; вже оброблених пропущено: {n_seen}; замало тексту: {n_short}")
+    lines.append(f"- Вже оброблених пропущено: {n_seen}; занадто коротких: {n_short}")
     if errors:
         lines.append(f"- Помилок: **{len(errors)}**. Перша: `{errors[0][:300]}`")
     if FEED_REPORT and all(n == 0 for _u, _s, n in FEED_REPORT):
@@ -1099,11 +1060,41 @@ def entry_date_gmt(entry):
         return None
 
 
+def build_manual_entry(url):
+    """Готує запис для обробки одного URL, надісланого через Telegram."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Потрібне коректне публічне HTTP(S)-посилання.")
+
+    text, image, page_html = get_article(url)
+    meta = trafilatura.extract_metadata(page_html)
+    title = (meta.title or "").strip() if meta else ""
+
+    if not title:
+        try:
+            doc = lxml_html.fromstring(page_html)
+            title_nodes = doc.xpath("//meta[@property='og:title']/@content | //meta[@name='twitter:title']/@content | //title/text()")
+            title = _clean(title_nodes[0]) if title_nodes else ""
+        except Exception:
+            title = ""
+
+    if not title:
+        title = parsed.path.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ") or parsed.hostname
+
+    return {
+        "link": url,
+        "title": title,
+        "summary": text,
+        "_article_data": (text, image, page_html),
+        "_manual": True,
+    }
+
+
 def main():
     started = time.time()
     seen = load_seen()
-    seen_keys = {normalize_url(url) for url in seen if normalize_url(url)}
     done = 0
+    manual_url = os.environ.get("ARTICLE_URL", "").strip()
 
     if MARK_SEEN_ONLY:
         # Службовий режим: позначаємо всі поточні новини зі стрічок як оброблені,
@@ -1111,17 +1102,16 @@ def main():
         added = 0
         for entry in collect_entries():
             link = entry.get("link")
-            key = normalize_url(link)
-            if key and key not in seen_keys:
+            if link and link not in seen:
                 seen.append(link)
-                seen_keys.add(key)
                 added += 1
         save_seen(seen)
         print(f"Позначено як оброблені: {added} новин. Нічого не опубліковано.")
         return
 
-    n_seen, n_new, n_short, errors = 0, 0, 0, []
-    for entry in collect_entries():
+    n_seen, n_short, errors = 0, 0, []
+    entries = [build_manual_entry(manual_url)] if manual_url else collect_entries()
+    for entry in entries:
         if done >= MAX_POSTS:
             break
         if time.time() - started > MAX_RUN_SECONDS:
@@ -1130,22 +1120,21 @@ def main():
         link = entry.get("link")
         if not link:
             continue
-        key = normalize_url(link)
-        if not key:
-            continue
-        if key in seen_keys:
+        if link in seen:
             n_seen += 1
             continue
-        n_new += 1
 
         try:
             page_ok = True
-            try:
-                text, image, page_html = get_article(link)
-            except Exception as e:
-                page_ok = False
-                print("Сторінку не відкрито, беру текст з RSS:", link, "->", e)
-                text, image, page_html = "", None, ""
+            if entry.get("_article_data"):
+                text, image, page_html = entry["_article_data"]
+            else:
+                try:
+                    text, image, page_html = get_article(link)
+                except Exception as e:
+                    page_ok = False
+                    print("Сторінку не відкрито, беру текст з RSS:", link, "->", e)
+                    text, image, page_html = "", None, ""
 
             if len(text) < 300:  # якщо зі сторінки текст не витягнувся, беремо з RSS
                 alt = rss_text(entry)
@@ -1154,8 +1143,12 @@ def main():
             if len(text) < MIN_TEXT:  # дуже короткий текст: додаємо заголовок новини
                 text = (entry.get("title", "") + ". " + text).strip(" .")
             if len(text) < MIN_TEXT:
-                print("Занадто короткий текст, цього разу пропускаю без позначення як оброблений:", link)
+                print("Занадто короткий текст, пропускаю:", link)
                 n_short += 1
+                if entry.get("_manual"):
+                    raise ValueError("Не вдалося отримати достатньо тексту зі сторінки.")
+                seen.append(link)
+                save_seen(seen)
                 continue
 
             links = find_source_links(page_html, link) if page_ok else []
@@ -1197,10 +1190,8 @@ def main():
                 data, image_id, images, status, tag_ids, entry_date_gmt(entry)
             )
             print(f"Створено ({status}):", post_link)
-            # URL потрапляє до seen.json лише після успішної відповіді WordPress.
             seen.append(link)
-            seen_keys.add(key)
-            save_seen(seen)
+            save_seen(seen)  # зберігаємо одразу, щоб не було дублів при збої
             done += 1
         except Exception as e:
             print("Помилка з новиною", link, "->", e)
@@ -1208,7 +1199,9 @@ def main():
 
     save_seen(seen)
     print(f"Готово. Нових матеріалів: {done}")
-    write_summary(done, n_seen, n_new, n_short, errors)
+    write_summary(done, n_seen, n_short, errors)
+    if manual_url and errors:
+        raise RuntimeError(errors[0])
 
 
 if __name__ == "__main__":
