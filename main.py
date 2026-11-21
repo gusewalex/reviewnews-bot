@@ -23,7 +23,7 @@ WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 POST_STATUS = os.environ.get("POST_STATUS", "draft")  # draft або publish
-MAX_POSTS = int(os.environ.get("MAX_POSTS", "3"))      # скільки новин за один запуск
+MAX_POSTS = int(os.environ.get("MAX_POSTS", "5"))      # скільки новин за один запуск
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 SEEN_FILE = "seen.json"
