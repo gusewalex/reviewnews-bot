@@ -84,6 +84,15 @@ PROMPT = """Ти досвідчений редактор українськог�
     <a href="адреса" target="_blank" rel="noopener">назва</a>
     на тому самому слові, з тією самою адресою. Адреси не змінюй і не
     вигадуй. Посилань, яких немає в оригіналі, не додавай.
+11. Видання-джерело: не згадуй у тексті видання, з якого взято новину
+    («Українська правда», «Європейська правда», «Економічна правда» тощо),
+    зокрема у фразах «інформує/повідомляє/пише ...». Першоджерело
+    (хто саме заявив чи написав: Зеленський на своєму акаунті, Bloomberg,
+    ДСНС тощо) залишай, разом із посиланням на нього. Приклади:
+    «Про це написав Зеленський на своєму акаунті в Х, інформує
+    „Європейська правда“.» -> «Про це написав Зеленський на своєму акаунті в Х.»
+    «Про це повідомляє Європейська правда з посиланням на Bloomberg.»
+    -> «Про це повідомляє Bloomberg.»
 
 Поверни JSON з полями:
 - "title": новий інформативний заголовок до 90 символів, без клікбейту і
@@ -685,11 +694,96 @@ def sentence_with(text, quote):
     return text[start:end].strip()[:700]
 
 
+# ---------- Видалення згадок видання-джерела («Європейська правда» тощо) ----------
+OUTLET_NAMES = [
+    "Українська правда. Життя", "Українська правда", "Української правди",
+    "Європейська правда", "Європейської правди", "Економічна правда",
+    "Економічної правди", "Європравда",
+]
+_OUT = "(?:" + "|".join(re.escape(n) for n in sorted(OUTLET_NAMES, key=len, reverse=True)) + ")"
+OUTLET_REF = (
+    r"(?:(?:видання|ресурс|портал|сайт)[ \t]+)?[«„“\"]?[ \t]*" + _OUT + r"[ \t]*[»”“\"]?"
+)
+OUTLET_ANY_RE = re.compile(_OUT, re.I)
+_VERBS = (
+    r"(?:інформує|повідомляє|пише|передає|розповідає|зазначає|наводить|цитує"
+    r"|інформують|повідомляють|пишуть)"
+)
+_VIA = r"(?:з посиланням на|із посиланням на|посилаючись на)"
+
+# «повідомляє Європейська правда з посиланням на Bloomberg» -> «повідомляє Bloomberg»
+RULE_A = re.compile(r"(" + _VERBS + r")[ \t]+" + OUTLET_REF + r"[ \t]+" + _VIA + r"[ \t]+", re.I)
+# окреме речення «Про це інформує Європейська правда.» -> прибрати
+RULE_F = re.compile(
+    r"(?:(?<=[.!?])[ \t]+|^)Про це[ \t]+" + _VERBS + r"[ \t]+" + OUTLET_REF + r"[ \t]*\.",
+    re.I | re.M,
+)
+# «..., інформує Європейська правда» -> прибрати
+RULE_B = re.compile(r"(?:[,;][ \t]*|[ \t]+)(?:як[ \t]+)?" + _VERBS + r"[ \t]+" + OUTLET_REF, re.I)
+# «Європейська правда» у лапках без дієслова -> просто назва (її приб'є GPT)
+RULE_E = re.compile(r"[«„“\"][ \t]*(" + _OUT + r")[ \t]*[»”“\"]", re.I)
+
+
+def clean_outlet_text(text):
+    t = RULE_A.sub(r"\1 ", text)
+    t = RULE_F.sub("", t)
+    t = RULE_B.sub("", t)
+    return RULE_E.sub(r"\1", t)
+
+
+def brand_from_url(url):
+    """bloomberg.com -> Bloomberg"""
+    parts = _host(url).split(".")
+    if len(parts) >= 3 and parts[-2] in ("co", "com", "org", "net"):
+        base = parts[-3]
+    elif len(parts) >= 2:
+        base = parts[-2]
+    else:
+        base = parts[0]
+    return base.capitalize()
+
+
+def fix_outlet_links(links):
+    """Якщо посилання стоїть на назві видання-джерела («Європейська правда» -> bloomberg.com),
+    переносимо його на назву першоджерела (Bloomberg)."""
+    for l in links:
+        l["context"] = clean_outlet_text(l["context"])
+        anchor = l["anchor"].strip(" «»„“”\"")
+        if re.fullmatch(_OUT, anchor, re.I):
+            brand = brand_from_url(l["url"])
+            m = re.search(re.escape(brand), l["context"], re.I)
+            l["anchor"] = m.group(0) if m else brand
+    return links
+
+
+def outlet_mentions(content):
+    plain = re.sub(r"<[^>]+>", " ", content)
+    return sorted({m.group(0) for m in OUTLET_ANY_RE.finditer(plain)})
+
+
+def final_outlet_cleanup(content):
+    """Страховка: прибирає згадки видання-джерела, що лишилися в готовому HTML."""
+    def repl(m):
+        inner = re.sub(r"<[^>]+>", "", m.group(2)).strip(" «»„“”\"")
+        if re.fullmatch(_OUT, inner, re.I):
+            prefix = m.group(0)[: m.start(2) - m.start(0)]
+            return prefix + escape(brand_from_url(m.group(1))) + "</a>"
+        return m.group(0)
+
+    c = A_TAG_RE.sub(repl, content)
+    c = clean_outlet_text(c)
+    # «<a>Bloomberg</a> з посиланням на Bloomberg» -> «<a>Bloomberg</a>»
+    c = re.sub(r"(<a\s[^>]*>([^<]+)</a>)\s+(?:з посиланням на|із посиланням на|посилаючись на)\s+\2", r"\1", c)
+    return re.sub(r"<p>\s*Про це\s*\.\s*</p>\s*", "", c)
+
+
 def rewrite_checked(title, text, links=None):
     """Переписує новину. Прямі цитати та посилання на джерела гарантовано
     переносяться з оригіналу без змін. Повертає (дані, статус_публікації)."""
     links = links or []
     text = strip_noise(text)  # прибираємо «читайте також» тощо до переписування
+    text = clean_outlet_text(text)  # прибираємо згадки видання-джерела до маскування цитат
+    links = fix_outlet_links(links)
     masked, quotes = mask_quotes(text)  # цитати йдуть до GPT як маркери
     notes = format_links(links)
     if quotes:
@@ -710,9 +804,17 @@ def rewrite_checked(title, text, links=None):
     data, used = attempt(notes)
     miss_q = [i for i in range(1, len(quotes) + 1) if i not in used]
     miss_l = missing_links(links, data["content"])
+    miss_o = outlet_mentions(data["content"])
 
-    if miss_q or miss_l:
+    if miss_q or miss_l or miss_o:
         extra = notes
+        if miss_o:
+            print("У тексті згадано видання-джерело, пробую ще раз:", miss_o)
+            extra += (
+                "\n\nУ попередній спробі лишилася згадка видання-джерела: "
+                + ", ".join(f"«{x}»" for x in miss_o)
+                + ". Прибери її (правило 11), залишивши лише першоджерело."
+            )
         if miss_q:
             print("Не використано цитати, пробую ще раз:", [f"Q{i}" for i in miss_q])
             extra += (
@@ -730,6 +832,12 @@ def rewrite_checked(title, text, links=None):
         data, used = attempt(extra)
         miss_q = [i for i in range(1, len(quotes) + 1) if i not in used]
         miss_l = missing_links(links, data["content"])
+
+    data["content"] = final_outlet_cleanup(data["content"])
+    for k in ("title", "excerpt"):
+        data[k] = clean_outlet_text(data.get(k) or "")
+    if outlet_mentions(data["content"]):
+        print("Увага: у тексті лишилася згадка видання-джерела:", outlet_mentions(data["content"]))
 
     if miss_q:  # гарантія: цитата не втрачається, додаємо її речення з оригіналу дослівно
         added = []
