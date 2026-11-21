@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # кожні 5 хвилин
   workflow_dispatch:         # дозволяє запускати вручну кнопкою
+    inputs:
+      mark_only:
+        description: "Лише позначити всі поточні новини як оброблені (без публікації)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -35,6 +40,7 @@ jobs:
           POST_STATUS: publish   # publish = одразу на сайт, draft = у чернетки
           MAX_POSTS: "30"        # скільки нових новин за один запуск
           MAX_ENTRIES: "60"      # скільки останніх новин читати з кожної стрічки
+          MARK_SEEN_ONLY: ${{ inputs.mark_only }}   # службовий режим (кнопка при ручному запуску)
         run: python main.py
 
       - name: Save list of processed news
