@@ -23,7 +23,7 @@ WP_USER = os.environ["WP_USER"]
 WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-POST_STATUS = os.environ.get("POST_STATUS", "publish")  # draft або publish
+POST_STATUS = os.environ.get("POST_STATUS", "draft")  # draft або publish
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "30"))     # скільки новин за один запуск
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
@@ -252,8 +252,12 @@ def find_photo_caption(html_text, image_url, is_main=False):
 
     if target is not None and target in pos:
         ti = pos[target]
+        img_pos = [pos[e] for e in elements if e.tag == "img"]
         best = None
         for ci, t, _el in credits:
+            # підпис належить найближчому до нього фото; чужі підписи не беремо
+            if min(img_pos, key=lambda x: abs(x - ci)) != ti:
+                continue
             d = ci - ti
             if 0 <= d <= 12 or -4 <= d < 0:
                 score = d if d >= 0 else 100 - d  # підписи після фото в пріоритеті
