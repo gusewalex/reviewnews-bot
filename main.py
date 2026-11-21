@@ -33,6 +33,7 @@ MIN_QUOTE_LEN = int(os.environ.get("MIN_QUOTE_LEN", "15"))  # коротші ф�
 RUN_LOOP_MINUTES = int(os.environ.get("RUN_LOOP_MINUTES", "0") or 0)  # >0: працювати безперервно стільки хвилин
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "240") or 240)       # пауза між перевірками в режимі циклу
 MARK_SEEN_ONLY = os.environ.get("MARK_SEEN_ONLY", "").strip().lower() == "true"  # лише запам'ятати поточні новини
+QUOTE_BLOCK_MIN_LEN = int(os.environ.get("QUOTE_BLOCK_MIN_LEN", "25") or 25)  # цитати від цієї довжини стають блоком «Цитата»
 MIN_TEXT = 40                                          # мінімальна довжина тексту новини
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "4"))    # скільки додаткових фото з новини
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -778,6 +779,8 @@ def unmask_quotes(content, quotes):
         i = int(m.group(1))
         if 1 <= i <= len(quotes):
             used.add(i)
+            if len(quotes[i - 1]) - 2 >= QUOTE_BLOCK_MIN_LEN:
+                return f"⟦QB{i}⟧"  # стане блоком «Цитата» у WordPress
             return escape(quotes[i - 1], quote=False)
         return ""
 
@@ -952,6 +955,7 @@ def rewrite_checked(title, text, links=None):
         print("Посилання додано в кінець статті:", [l["url"] for l in miss_l])
         data["content"] = append_missing_links(data["content"], miss_l)
     data["content"] = add_target_blank(data["content"])
+    data["content"] = quotes_to_blocks(data["content"], quotes)
     return data, POST_STATUS
 
 
@@ -991,28 +995,101 @@ def build_figure(image_url, caption, alt):
     )
 
 
+UNIT_RE = re.compile(r"(<blockquote\b.*?</blockquote>|<p\b.*?</p>)", re.S | re.I)
+SENT_RE = re.compile(r"⟦QB(\d+)⟧")
+
+
+def quotes_to_blocks(content, quotes):
+    """Довгі цитати виносить з абзацу в окремий блок-цитату (blockquote).
+    «Міністр сказав: ⟦QB1⟧ — наголосив він.» ->
+    <p>Міністр сказав:</p> <blockquote>«цитата»</blockquote> <p>— наголосив він.</p>"""
+    parts = UNIT_RE.split(content)
+    out = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1 and part.lower().startswith("<p") and SENT_RE.search(part):
+            inner = re.sub(r"^<p\b[^>]*>|</p>$", "", part, flags=re.I | re.S)
+            pieces = SENT_RE.split(inner)  # [текст, номер, текст, номер, ...]
+            blocks = []
+            for k, piece in enumerate(pieces):
+                if k % 2 == 0:
+                    txt = piece.strip()
+                    if k > 0:
+                        txt = re.sub(r"^[\s,;:]+", "", txt)  # розділові знаки після цитати
+                    plain = re.sub(r"<[^>]+>", "", txt)
+                    if re.sub(r"[\W_]+", "", plain):
+                        blocks.append(f"<p>{txt}</p>")
+                else:
+                    q = quotes[int(piece) - 1]
+                    blocks.append(
+                        f'<blockquote class="wp-block-quote"><p>{escape(q, quote=False)}</p></blockquote>'
+                    )
+            out.append("\n".join(blocks))
+        else:
+            out.append(part)
+    c = "".join(out)
+    # якщо маркер лишився поза абзацом, вставляємо цитату звичайним текстом
+    return SENT_RE.sub(lambda m: escape(quotes[int(m.group(1)) - 1], quote=False), c)
+
+
+def to_blocks(content):
+    """Обгортає абзаци й цитати в блоки редактора WordPress (щоб цитата була блоком «Цитата»)."""
+    parts = UNIT_RE.split(content)
+    out = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            if part.lower().startswith("<blockquote"):
+                inner = re.sub(r"^<blockquote\b[^>]*>|</blockquote>$", "", part, flags=re.I | re.S)
+                inner = re.sub(
+                    r"(<p\b.*?</p>)", r"<!-- wp:paragraph -->\1<!-- /wp:paragraph -->",
+                    inner, flags=re.S | re.I,
+                )
+                out.append(
+                    '<!-- wp:quote -->\n<blockquote class="wp-block-quote">'
+                    + inner + "</blockquote>\n<!-- /wp:quote -->\n"
+                )
+            else:
+                out.append("<!-- wp:paragraph -->\n" + part + "\n<!-- /wp:paragraph -->\n")
+        else:
+            out.append(part)
+    return "".join(out)
+
+
 def insert_figures(content, figures):
     """Розставляє фото по тексту: перше після 1-го абзацу, далі після 3-го,
-    5-го, 7-го... Якщо абзаців менше, решта йде в кінець статті."""
+    5-го, 7-го... Якщо абзаців менше, решта йде в кінець статті.
+    Блоки-цитати не розриваються."""
     if not figures:
         return content
-    parts = content.split("</p>")
-    paragraphs = [p + "</p>" for p in parts[:-1]]
-    tail = parts[-1]
-    if not paragraphs:
+    parts = UNIT_RE.split(content)
+    n_par = sum(1 for i in range(1, len(parts), 2) if parts[i].lower().startswith("<p"))
+    if n_par == 0:
         return "\n".join(figures) + "\n" + content
 
     slots = [1, 3, 5, 7, 9, 11]
     fig_at = {}
-    for i, fig in enumerate(figures):
-        n = slots[i] if i < len(slots) else len(paragraphs)
-        fig_at.setdefault(min(n, len(paragraphs)), []).append(fig)
+    for k, fig in enumerate(figures):
+        n = slots[k] if k < len(slots) else n_par
+        fig_at.setdefault(min(n, n_par), []).append(fig)
 
-    out = []
-    for i, para in enumerate(paragraphs, 1):
-        out.append(para)
-        out.extend(fig_at.get(i, []))
-    return "\n".join(out) + tail
+    out, count, pending = [], 0, []
+    for i, part in enumerate(parts):
+        out.append(part)
+        if i % 2 == 1 and part.lower().startswith("<blockquote"):
+            for fig in pending:  # фото, відкладені до кінця блоку-цитати
+                out.append("\n" + fig + "\n")
+            pending = []
+        elif i % 2 == 1 and part.lower().startswith("<p"):
+            count += 1
+            figs = fig_at.get(count, [])
+            nxt = parts[i + 2].lower() if i + 2 < len(parts) else ""
+            if figs and nxt.startswith("<blockquote"):
+                pending.extend(figs)  # не вставляємо фото між вступом і цитатою
+            else:
+                for fig in figs:
+                    out.append("\n" + fig + "\n")
+    for fig in pending:
+        out.append("\n" + fig + "\n")
+    return "".join(out)
 
 
 def clean_tags(raw):
@@ -1063,7 +1140,7 @@ def get_tag_ids(names):
 def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None):
     """images: список (адреса фото на вашому сайті, підпис або None)."""
     figures = [build_figure(u, c, data["title"]) for u, c in images]
-    content = insert_figures(data["content"], figures)
+    content = to_blocks(insert_figures(data["content"], figures))
     payload = {
         "title": data["title"],
         "content": content,
