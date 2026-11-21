@@ -118,6 +118,48 @@ def _caption_from_text(t):
     return _clean(m.group(0)) if m else None
 
 
+# ---------- Заборона підписів-джерел типу «Фото: pravda.com.ua» ----------
+SITE_NAMES = {
+    "українська правда", "українську правду", "укрправда",
+    "24 канал", "канал 24", "телеканал 24", "24tv", "pravda",
+}
+for _f in FEEDS:  # назви й домени джерел з FEEDS теж заборонені
+    _host = urlparse(_f).netloc.lower().removeprefix("www.")
+    if _host:
+        SITE_NAMES.add(_host)
+        SITE_NAMES.add(_host.split(".")[0])
+
+DOMAIN_RE = re.compile(
+    r"(?:https?://|www\.)\S+|\b(?:[a-z0-9-]+\.)+(?:ua|com|net|org|info|ru|eu|tv|io|media|news)\b",
+    re.I,
+)
+
+
+def is_site_part(text):
+    """True, якщо фрагмент підпису це сайт/домен або назва сайту-джерела."""
+    low = text.lower()
+    return bool(DOMAIN_RE.search(text)) or any(n in low for n in SITE_NAMES)
+
+
+def sanitize_caption(caption):
+    """Прибирає з підпису сайти як джерела.
+    'Фото: pravda.com.ua' -> None;
+    'Фото: Запорізька ОВА / pravda.com.ua' -> 'Фото: Запорізька ОВА'."""
+    if not caption:
+        return None
+    prefix, sep, rest = caption.partition(":")
+    if not sep:
+        return None if is_site_part(caption) else caption
+    rest2 = DOMAIN_RE.sub(" / ", rest)  # адреси й домени вирізаємо одразу
+    parts = [x.strip() for x in re.split(r"\s*[/|;,]\s*", rest2) if x.strip()]
+    good = [x for x in parts if not any(n in x.lower() for n in SITE_NAMES)]
+    if not good:
+        return None
+    if rest2 == rest and len(good) == len(parts):
+        return caption
+    return f"{prefix.strip()}: {', '.join(good)}"
+
+
 def find_photo_caption(html_text, image_url):
     """Шукає на сторінці новини підпис до головного фото
     (наприклад, 'Фото: Getty Images'). Повертає текст або None."""
@@ -395,7 +437,7 @@ def main():
             img_url = image or entry_image(entry)
             if img_url:
                 image_id, wp_image_url = upload_image(img_url)
-                caption = find_photo_caption(page_html, img_url)
+                caption = sanitize_caption(find_photo_caption(page_html, img_url))
                 print("Підпис до фото:", caption or "(не знайдено, без підпису)")
 
             tag_ids = get_tag_ids(data.get("tags"))
