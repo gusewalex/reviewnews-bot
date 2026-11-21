@@ -139,6 +139,7 @@ def _caption_from_text(t):
 SITE_NAMES = {
     "українська правда", "українську правду", "укрправда",
     "24 канал", "канал 24", "телеканал 24", "24tv", "pravda",
+    "рбк-україна", "рбк україна", "рбк", "rbc-ukraine", "rbc ukraine",
 }
 for _f in FEEDS:  # назви й домени джерел з FEEDS теж заборонені
     _host = urlparse(_f).netloc.lower().removeprefix("www.")
