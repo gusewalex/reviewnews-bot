@@ -24,7 +24,7 @@ FEEDS = [
 # У яку категорію WordPress публікувати новини з певної стрічки.
 # Стрічки, яких тут немає, публікуються без вказаної категорії (як раніше).
 FEED_CATEGORIES = {
-    "https://champion.com.ua/ukr/rss/": "СПОРТ",
+    "https://suspilne.media/sport/rss/latest.rss": "СПОРТ",
 }
 
 WP_URL = os.environ["WP_URL"].rstrip("/")
@@ -836,7 +836,7 @@ OUTLET_NAMES = [
     "Європейська правда", "Європейської правди", "Економічна правда",
     "Економічної правди", "Європравда",
     "www.eurointegration.com.ua", "eurointegration.com.ua", "Eurointegration",
-    "www.champion.com.ua", "champion.com.ua",
+    "www.suspilne.media", "suspilne.media",
 ]
 BLOCKED_URL_RE = re.compile(
     r"https?://(?:[\w-]+\.)*(?:" + "|".join(re.escape(h) for h in BLOCK_LINK_HOSTS) + r")\S*", re.I
