@@ -18,13 +18,14 @@ from openai import OpenAI
 FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
     "https://epravda.com.ua/rss/news/",
+    "https://nv.ua/ukr/rss/2371.xml",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
 # У яку категорію WordPress публікувати новини з певної стрічки.
 # Стрічки, яких тут немає, публікуються без вказаної категорії (як раніше).
 FEED_CATEGORIES = {
-    "https://suspilne.media/sport/rss/latest.rss": "СПОРТ",
+    "https://nv.ua/ukr/rss/2371.xml": "СПОРТ",
 }
 
 WP_URL = os.environ["WP_URL"].rstrip("/")
