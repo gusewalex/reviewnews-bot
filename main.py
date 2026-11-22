@@ -18,6 +18,7 @@ from openai import OpenAI
 FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
     "https://epravda.com.ua/rss/news/",
+    "https://suspilne.media/sport/rss/latest.rss",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
