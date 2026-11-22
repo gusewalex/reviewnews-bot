@@ -2,8 +2,8 @@ name: WordPress news bot
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # GitHub запускає перевірку приблизно кожні 10 хвилин
-  workflow_dispatch:         # дозволяє запускати вручну кнопкою
+    - cron: "17,47 * * * *"  # запасний запуск (поза «піковими» хвилинами GitHub)
+  workflow_dispatch:         # ручний запуск кнопкою; також так бот запускає сам себе
     inputs:
       mark_only:
         description: "Лише позначити всі поточні новини як оброблені (без публікації)"
@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  actions: write             # щоб бот міг запустити наступний запуск
 
 concurrency:
   group: news-bot
@@ -20,7 +21,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@v4
 
@@ -38,9 +39,10 @@ jobs:
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           POST_STATUS: publish        # publish = одразу на сайт, draft = у чернетки
-          MAX_POSTS: "30"             # скільки нових новин за одну перевірку
+          MAX_POSTS: "10"             # скільки нових новин за одну перевірку
           MAX_ENTRIES: "60"           # скільки останніх новин читати зі стрічки
-          RUN_LOOP_MINUTES: "30"      # бот працює безперервно 30 хв, перевіряючи стрічку кожні 4 хв (0 = одна перевірка)
+          MAX_AGE_HOURS: "6"          # новини старші за 6 годин не публікуються
+          RUN_LOOP_MINUTES: "55"      # бот працює безперервно 55 хв, перевіряючи стрічку кожні 4 хв
           POLL_SECONDS: "240"
           MARK_SEEN_ONLY: ${{ inputs.mark_only }}
         run: python main.py
@@ -48,3 +50,9 @@ jobs:
       - name: Save list of processed news
         if: always()                  # зберігаємо список навіть якщо запуск завершився помилкою
         run: python save_seen.py
+
+      - name: Start next run
+        if: always()                  # бот сам запускає наступний запуск: без пауз між ними
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run news.yml --ref ${{ github.ref_name }}
