@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 import time
-from html import escape
+from html import escape, unescape
 from urllib.parse import urljoin, urlparse
 
 import feedparser
@@ -17,9 +17,15 @@ from openai import OpenAI
 # ---------- Налаштування ----------
 FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
-    "https://champion.com.ua/ukr/rss/"
+    "https://champion.com.ua/ukr/rss/",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
+
+# У яку категорію WordPress публікувати новини з певної стрічки.
+# Стрічки, яких тут немає, публікуються без вказаної категорії (як раніше).
+FEED_CATEGORIES = {
+    "https://champion.com.ua/ukr/rss/": "СПОРТ",
+}
 
 WP_URL = os.environ["WP_URL"].rstrip("/")
 WP_USER = os.environ["WP_USER"]
@@ -28,10 +34,11 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 POST_STATUS = os.environ.get("POST_STATUS", "publish")  # publish або draft
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "10"))     # скільки новин за одну перевірку
-# розділи сайту, які бот не публікує (частини адреси через кому); /columns/ = авторські колонки
+# розділи сайту, які бот не публікує (частини адреси через кому):
+# /columns/ = авторські колонки, /articles/ = проєкти та великі матеріали
 SKIP_URL_PARTS = [
     x.strip().lower()
-    for x in (os.environ.get("SKIP_URL_PARTS") or "/columns/").split(",")
+    for x in (os.environ.get("SKIP_URL_PARTS") or "/columns/,/articles/").split(",")
     if x.strip()
 ]
 # сайти, на які бот не робить посилань і назви яких прибирає з тексту
@@ -194,10 +201,19 @@ DOMAIN_RE = re.compile(
 )
 
 
+SITE_NAME_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(n) for n in sorted(SITE_NAMES, key=len, reverse=True)) + r")(?!\w)",
+    re.I,
+)
+
+
+def has_site_name(text):
+    return bool(SITE_NAME_RE.search(text))
+
+
 def is_site_part(text):
     """True, якщо фрагмент підпису це сайт/домен або назва сайту-джерела."""
-    low = text.lower()
-    return bool(DOMAIN_RE.search(text)) or any(n in low for n in SITE_NAMES)
+    return bool(DOMAIN_RE.search(text)) or has_site_name(text)
 
 
 def sanitize_caption(caption):
@@ -223,7 +239,7 @@ def sanitize_caption(caption):
         return None if (not cleaned or is_site_part(cleaned)) else cleaned
     rest2 = DOMAIN_RE.sub(" / ", rest)  # адреси й домени вирізаємо одразу
     parts = [x.strip() for x in re.split(r"\s*[/|;,]\s*", rest2) if x.strip()]
-    good = [x for x in parts if not any(n in x.lower() for n in SITE_NAMES)]
+    good = [x for x in parts if not has_site_name(x)]
     if not good:
         return None
     if rest2 == rest and len(good) == len(parts):
@@ -823,6 +839,7 @@ OUTLET_NAMES = [
     "Європейська правда", "Європейської правди", "Економічна правда",
     "Економічної правди", "Європравда",
     "www.eurointegration.com.ua", "eurointegration.com.ua", "Eurointegration",
+    "www.champion.com.ua", "champion.com.ua",
 ]
 BLOCKED_URL_RE = re.compile(
     r"https?://(?:[\w-]+\.)*(?:" + "|".join(re.escape(h) for h in BLOCK_LINK_HOSTS) + r")\S*", re.I
@@ -1161,7 +1178,44 @@ def get_tag_ids(names):
     return ids
 
 
-def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None):
+_CATEGORY_CACHE = {}
+
+
+def get_category_id(name):
+    """Знаходить категорію WordPress за назвою (регістр не важливий) або створює її."""
+    key = name.strip().upper()
+    if key in _CATEGORY_CACHE:
+        return _CATEGORY_CACHE[key]
+    cid = None
+    try:
+        r = requests.get(
+            f"{WP_URL}/wp-json/wp/v2/categories",
+            auth=auth,
+            params={"search": name, "per_page": 50},
+            timeout=30,
+        )
+        r.raise_for_status()
+        for c in r.json():
+            if unescape(c["name"]).strip().upper() == key:
+                cid = c["id"]
+                break
+        if cid is None:
+            r = requests.post(
+                f"{WP_URL}/wp-json/wp/v2/categories", auth=auth, json={"name": name}, timeout=30
+            )
+            if r.status_code == 400 and r.json().get("code") == "term_exists":
+                cid = r.json()["data"]["term_id"]
+            else:
+                r.raise_for_status()
+                cid = r.json()["id"]
+    except Exception as e:
+        print("Категорію не знайдено й не створено:", name, "->", e)
+    if cid is not None:
+        _CATEGORY_CACHE[key] = cid
+    return cid
+
+
+def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None):
     """images: список (адреса фото на вашому сайті, підпис або None)."""
     figures = [build_figure(u, c, data["title"]) for u, c in images]
     content = to_blocks(insert_figures(data["content"], figures))
@@ -1175,6 +1229,8 @@ def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None):
         payload["featured_media"] = image_id
     if tag_ids:
         payload["tags"] = tag_ids
+    if category_ids:
+        payload["categories"] = category_ids
     if date_gmt:
         payload["date_gmt"] = date_gmt  # час публікації як у джерела
     resp = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", auth=auth, json=payload, timeout=60)
@@ -1210,6 +1266,11 @@ def collect_entries():
         print(f"{feed_url}: {status}, новин у стрічці: {len(entries)}")
         if not entries:
             print("ПРОБЛЕМА: стрічка порожня або недоступна (можливо, сайт блокує запити з GitHub)")
+        for e in entries:
+            try:
+                e["_feed"] = feed_url  # з якої стрічки новина (для категорій)
+            except Exception:
+                pass
         per_feed.append(entries[:MAX_ENTRIES])
 
     mixed = []
@@ -1380,9 +1441,18 @@ def run_once():
             tag_ids = get_tag_ids(data.get("tags"))
             print("Позначки:", clean_tags(data.get("tags")))
 
+            cat_name = FEED_CATEGORIES.get(entry.get("_feed"))
+            category_ids = []
+            if cat_name:
+                cid = get_category_id(cat_name)
+                if cid:
+                    category_ids = [cid]
+                print("Категорія:", cat_name if cid else f"{cat_name} (не вдалося, без категорії)")
+
             post_link = create_post(
                 data, image_id, images, status, tag_ids,
-                entry_date_gmt(entry) if USE_SOURCE_DATE else None
+                entry_date_gmt(entry) if USE_SOURCE_DATE else None,
+                category_ids,
             )
             print(f"Створено ({status}):", post_link)
             seen.append(link)
