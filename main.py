@@ -33,6 +33,12 @@ SKIP_URL_PARTS = [
     for x in (os.environ.get("SKIP_URL_PARTS") or "/columns/").split(",")
     if x.strip()
 ]
+# сайти, на які бот не робить посилань і назви яких прибирає з тексту
+BLOCK_LINK_HOSTS = [
+    x.strip().lower()
+    for x in (os.environ.get("BLOCK_LINK_HOSTS") or "eurointegration.com.ua,epravda.com.ua").split(",")
+    if x.strip()
+]
 MAX_AGE_HOURS = float(os.environ.get("MAX_AGE_HOURS", "6") or 0)  # старіші новини не публікуємо (0 = без обмеження)
 USE_SOURCE_DATE = os.environ.get("USE_SOURCE_DATE", "").strip().lower() == "true"  # ставити час публікації як у джерела
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
@@ -98,8 +104,9 @@ PROMPT = """Ти досвідчений редактор українськог�
     на тому самому слові, з тією самою адресою. Адреси не змінюй і не
     вигадуй. Посилань, яких немає в оригіналі, не додавай.
 11. Видання-джерело: не згадуй у тексті видання, з якого взято новину
-    («Українська правда», «Європейська правда», «Економічна правда» тощо),
-    зокрема у фразах «інформує/повідомляє/пише ...». Першоджерело
+    («Українська правда», «Європейська правда» / Eurointegration,
+    «Економічна правда» тощо), зокрема у фразах «інформує/повідомляє/пише ...»,
+    і не роби посилань на сайти цих видань. Першоджерело
     (хто саме заявив чи написав: Зеленський на своєму акаунті, Bloomberg,
     ДСНС тощо) залишай, разом із посиланням на нього. Приклади:
     «Про це написав Зеленський на своєму акаунті в Х, інформує
@@ -172,6 +179,7 @@ def _caption_from_text(t):
 SITE_NAMES = {
     "українська правда", "українську правду", "укрправда",
     "24 канал", "канал 24", "телеканал 24", "24tv", "pravda",
+    "eurointegration", "європейська правда", "європейської правди",
 }
 for _f in FEEDS:  # назви й домени джерел з FEEDS теж заборонені
     _host = urlparse(_f).netloc.lower().removeprefix("www.")
@@ -676,6 +684,8 @@ def find_source_links(html_text, page_url):
         host = _host(url)
         if not host or host == page_host or host.endswith("." + page_host):
             continue
+        if any(host == h or host.endswith("." + h) for h in BLOCK_LINK_HOSTS):
+            continue  # посилання на сайти з чорного списку (Eurointegration тощо) не зберігаємо
         anchor = _text(a)
         if not anchor or len(anchor) > 150:
             continue
@@ -811,7 +821,11 @@ OUTLET_NAMES = [
     "Українська правда. Життя", "Українська правда", "Української правди",
     "Європейська правда", "Європейської правди", "Економічна правда",
     "Економічної правди", "Європравда",
+    "www.eurointegration.com.ua", "eurointegration.com.ua", "Eurointegration",
 ]
+BLOCKED_URL_RE = re.compile(
+    r"https?://(?:[\w-]+\.)*(?:" + "|".join(re.escape(h) for h in BLOCK_LINK_HOSTS) + r")\S*", re.I
+)
 _OUT = "(?:" + "|".join(re.escape(n) for n in sorted(OUTLET_NAMES, key=len, reverse=True)) + ")"
 OUTLET_REF = (
     r"(?:(?:видання|ресурс|портал|сайт)[ \t]+)?[«„“\"]?[ \t]*" + _OUT + r"[ \t]*[»”“\"]?"
@@ -837,7 +851,8 @@ RULE_E = re.compile(r"[«„“\"][ \t]*(" + _OUT + r")[ \t]*[»”“\"]", re.I
 
 
 def clean_outlet_text(text):
-    t = RULE_A.sub(r"\1 ", text)
+    t = BLOCKED_URL_RE.sub("", text)  # голі адреси сайтів з чорного списку
+    t = RULE_A.sub(r"\1 ", t)
     t = RULE_F.sub("", t)
     t = RULE_B.sub("", t)
     return RULE_E.sub(r"\1", t)
