@@ -18,6 +18,7 @@ from openai import OpenAI
 FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
     "https://epravda.com.ua/rss/news/",
+    "https://nv.ua/ukr/rss/2371.xml",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
@@ -35,16 +36,16 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 POST_STATUS = os.environ.get("POST_STATUS", "publish")  # publish або draft
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "10"))     # скільки новин за одну перевірку
 # розділи сайту, які бот не публікує (частини адреси через кому):
-# /columns/ = авторські колонки, /articles/ = проєкти та великі матеріали
+# /columns/ і /opinion/ = авторські колонки та думки, /articles/ = проєкти та великі матеріали
 SKIP_URL_PARTS = [
     x.strip().lower()
-    for x in (os.environ.get("SKIP_URL_PARTS") or "/columns/,/articles/").split(",")
+    for x in (os.environ.get("SKIP_URL_PARTS") or "/columns/,/articles/,/opinion/").split(",")
     if x.strip()
 ]
 # сайти, на які бот не робить посилань і назви яких прибирає з тексту
 BLOCK_LINK_HOSTS = [
     x.strip().lower()
-    for x in (os.environ.get("BLOCK_LINK_HOSTS") or "eurointegration.com.ua,epravda.com.ua").split(",")
+    for x in (os.environ.get("BLOCK_LINK_HOSTS") or "eurointegration.com.ua,epravda.com.ua,nv.ua").split(",")
     if x.strip()
 ]
 MAX_AGE_HOURS = float(os.environ.get("MAX_AGE_HOURS", "6") or 0)  # старіші новини не публікуємо (0 = без обмеження)
@@ -112,7 +113,8 @@ PROMPT = """Ти досвідчений редактор українськог�
     вигадуй. Посилань, яких немає в оригіналі, не додавай.
 11. Видання-джерело: не згадуй у тексті видання, з якого взято новину
     («Українська правда», «Європейська правда» / Eurointegration,
-    «Економічна правда» тощо), зокрема у фразах «інформує/повідомляє/пише ...»,
+    «Економічна правда», NV / НВ (nv.ua) тощо), зокрема у фразах
+    «інформує/повідомляє/пише ...»,
     і не роби посилань на сайти цих видань. Першоджерело
     (хто саме заявив чи написав: Зеленський на своєму акаунті, Bloomberg,
     ДСНС тощо) залишай, разом із посиланням на нього. Приклади:
@@ -120,6 +122,23 @@ PROMPT = """Ти досвідчений редактор українськог�
     „Європейська правда“.» -> «Про це написав Зеленський на своєму акаунті в Х.»
     «Про це повідомляє Європейська правда з посиланням на Bloomberg.»
     -> «Про це повідомляє Bloomberg.»
+
+12. СТРУКТУРА СТАТТІ (завжди саме так):
+    Абзац 1: головна цитата новини, тобто найважливіша пряма мова (використай її
+    маркер [[Qn]]) із вказівкою, хто це сказав. Якщо прямої мови в оригіналі
+    немає, абзац 1 це головний факт новини однією-двома фразами.
+    Абзац 2: джерело інформації, хто повідомляє: розгорнуте речення з посиланнями
+    на джерела з оригіналу (телеграм-канали, сторінки посадовців у Facebook чи Х,
+    видання, відомства). Приклади:
+    «Про це повідомив голова Дніпропетровської ОВА <a href="...">Олександр Ганжа</a>.»
+    «Про це йдеться в статистиці валютних інтервенцій <a href="...">НБУ</a>.»
+    «За інформацією <a href="...">поліція</a> та <a href="...">Донецька обласна
+    прокуратура</a>.»  «Про це повідомляє <a href="...">Ceske Noviny</a>.»
+    Якщо посилань немає, але є згадка («Повідомляє ДСНС»), напиши її тут так само
+    розгорнуто. ЗАБОРОНЕНО писати лише «Посилання: ...» або «Джерело: ...» без
+    підмета й дієслова. Рядки «Посилання: ...» з оригіналу не копіюй, а
+    переформулюй у речення за цим зразком.
+    Далі: решта подій і деталей новини.
 
 Поверни JSON з полями:
 - "title": новий інформативний заголовок до 90 символів, без клікбейту і
@@ -142,11 +161,43 @@ def save_seen(seen):
         json.dump(seen[-2000:], f, ensure_ascii=False, indent=1)
 
 
+class SkipArticle(Exception):
+    """Матеріал із розділу, який не публікуємо (колонки, проєкти)."""
+
+
+def is_skipped_url(u):
+    path = urlparse(u or "").path.lower()
+    return any(part in path for part in SKIP_URL_PARTS)
+
+
+def canonical_urls(html_text):
+    """Канонічна адреса сторінки (link rel=canonical, og:url)."""
+    try:
+        doc = lxml_html.fromstring(html_text)
+        return doc.xpath('//link[@rel="canonical"]/@href') + doc.xpath('//meta[@property="og:url"]/@content')
+    except Exception:
+        return []
+
+
+def entry_urls(entry):
+    """Усі адреси новини з RSS-запису (посилання, guid, додаткові посилання)."""
+    urls = [entry.get("link"), entry.get("id"), entry.get("guid")]
+    for l in entry.get("links", []) or []:
+        if isinstance(l, dict):
+            urls.append(l.get("href"))
+    return [u for u in urls if isinstance(u, str) and u]
+
+
 def get_article(url):
     """Повертає (текст, посилання на картинку, HTML сторінки)."""
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()  # 403/503 тощо: сайт блокує бота, тоді беремо текст з RSS
+    if is_skipped_url(getattr(r, "url", "")):
+        raise SkipArticle(r.url)  # після перенаправлення потрапили в розділ колонок/проєктів
     html = r.text
+    for u in canonical_urls(html):
+        if is_skipped_url(u):
+            raise SkipArticle(u)
     text = trafilatura.extract(html) or ""
     meta = trafilatura.extract_metadata(html)
     image = meta.image if meta and meta.image else None
@@ -187,6 +238,7 @@ SITE_NAMES = {
     "українська правда", "українську правду", "укрправда",
     "24 канал", "канал 24", "телеканал 24", "24tv", "pravda",
     "eurointegration", "європейська правда", "європейської правди",
+    "економічна правда", "економічної правди", "нв", "nv",
 }
 for _f in FEEDS:  # назви й домени джерел з FEEDS теж заборонені
     _host = urlparse(_f).netloc.lower().removeprefix("www.")
@@ -741,7 +793,9 @@ def format_links(links):
         "Посилання з оригіналу. Кожне з них ОБОВ'ЯЗКОВО збережи в переписаному тексті "
         'як HTML-посилання <a href="адреса" target="_blank" rel="noopener">слово або '
         "назва, на яких воно стоїть</a> (адресу не змінюй). Згадки про те, хто повідомив "
-        "чи заявив, також залишай:"
+        "чи заявив, також залишай. Якщо в оригіналі посилання подано рядком "
+        "«Посилання: ...» чи «Джерело: ...», перепиши його розгорнутим реченням "
+        "(«За інформацією ...», «Про це повідомляє ...»), а не копіюй рядок:"
     ]
     for i, l in enumerate(links, 1):
         lines.append(f"{i}. «{l['anchor']}» → {l['url']} (абзац в оригіналі: «{l['context']}»)")
@@ -769,12 +823,20 @@ def missing_links(links, content):
     return [l for l in links if url_key(l["url"]) not in present]
 
 
-def append_missing_links(content, missing):
-    items = ", ".join(
+def add_missing_links(content, missing):
+    """Втрачені посилання додаємо розгорнутим реченням («За інформацією ...»)
+    другим абзацом статті, а не рядком «Посилання: ...» в кінці."""
+    items = [
         f'<a href="{escape(l["url"])}" target="_blank" rel="noopener">{escape(l["anchor"])}</a>'
         for l in missing
-    )
-    return content + f"\n<p>Посилання: {items}</p>"
+    ]
+    joined = items[0] if len(items) == 1 else ", ".join(items[:-1]) + " та " + items[-1]
+    sentence = f"<p>За інформацією {joined}.</p>"
+    i = content.lower().find("</p>")
+    if i == -1:
+        return sentence + "\n" + content
+    i += len("</p>")
+    return content[:i] + "\n" + sentence + content[i:]
 
 
 def add_target_blank(content):
@@ -837,11 +899,15 @@ OUTLET_NAMES = [
     "Економічної правди", "Європравда",
     "www.eurointegration.com.ua", "eurointegration.com.ua", "Eurointegration",
     "www.suspilne.media", "suspilne.media",
+    "www.epravda.com.ua", "epravda.com.ua",
+    "www.nv.ua", "nv.ua", "NV", "НВ",
 ]
 BLOCKED_URL_RE = re.compile(
     r"https?://(?:[\w-]+\.)*(?:" + "|".join(re.escape(h) for h in BLOCK_LINK_HOSTS) + r")\S*", re.I
 )
-_OUT = "(?:" + "|".join(re.escape(n) for n in sorted(OUTLET_NAMES, key=len, reverse=True)) + ")"
+_OUT = "(?:" + "|".join(
+    r"(?<!\w)" + re.escape(n) + r"(?!\w)" for n in sorted(OUTLET_NAMES, key=len, reverse=True)
+) + ")"
 OUTLET_REF = (
     r"(?:(?:видання|ресурс|портал|сайт)[ \t]+)?[«„“\"]?[ \t]*" + _OUT + r"[ \t]*[»”“\"]?"
 )
@@ -990,8 +1056,8 @@ def rewrite_checked(title, text, links=None):
         print("Цитати додано дослівно з оригіналу:", len(miss_q))
         data["content"] += "".join(f"\n<p>{escape(x, quote=False)}</p>" for x in added)
     if miss_l:  # гарантія: посилання не втрачаються
-        print("Посилання додано в кінець статті:", [l["url"] for l in miss_l])
-        data["content"] = append_missing_links(data["content"], miss_l)
+        print("Посилання додано другим абзацом:", [l["url"] for l in miss_l])
+        data["content"] = add_missing_links(data["content"], miss_l)
     data["content"] = add_target_blank(data["content"])
     return data, POST_STATUS
 
@@ -1034,40 +1100,29 @@ def build_figure(image_url, caption, alt):
 
 UNIT_RE = re.compile(r"(<blockquote\b.*?</blockquote>|<p\b.*?</p>)", re.S | re.I)
 def insert_figures(content, figures):
-    """Розставляє фото по тексту: перше після 1-го абзацу, далі після 3-го,
-    5-го, 7-го... Якщо абзаців менше, решта йде в кінець статті.
-    Блоки-цитати не розриваються."""
+    """Перше (головне) фото завжди на самому початку статті, перед першим абзацом.
+    Додаткові фото: після 3-го, 5-го, 7-го... абзацу (якщо абзаців менше, у кінець)."""
     if not figures:
         return content
+    first, rest = figures[0], figures[1:]
     parts = UNIT_RE.split(content)
     n_par = sum(1 for i in range(1, len(parts), 2) if parts[i].lower().startswith("<p"))
     if n_par == 0:
         return "\n".join(figures) + "\n" + content
 
-    slots = [1, 3, 5, 7, 9, 11]
+    slots = [3, 5, 7, 9, 11]
     fig_at = {}
-    for k, fig in enumerate(figures):
+    for k, fig in enumerate(rest):
         n = slots[k] if k < len(slots) else n_par
         fig_at.setdefault(min(n, n_par), []).append(fig)
 
-    out, count, pending = [], 0, []
+    out, count = [first + "\n"], 0
     for i, part in enumerate(parts):
         out.append(part)
-        if i % 2 == 1 and part.lower().startswith("<blockquote"):
-            for fig in pending:  # фото, відкладені до кінця блоку-цитати
-                out.append("\n" + fig + "\n")
-            pending = []
-        elif i % 2 == 1 and part.lower().startswith("<p"):
+        if i % 2 == 1 and part.lower().startswith("<p"):
             count += 1
-            figs = fig_at.get(count, [])
-            nxt = parts[i + 2].lower() if i + 2 < len(parts) else ""
-            if figs and nxt.startswith("<blockquote"):
-                pending.extend(figs)  # не вставляємо фото між вступом і цитатою
-            else:
-                for fig in figs:
-                    out.append("\n" + fig + "\n")
-    for fig in pending:
-        out.append("\n" + fig + "\n")
+            for fig in fig_at.get(count, []):
+                out.append("\n" + fig + "\n")
     return "".join(out)
 
 
@@ -1309,10 +1364,10 @@ def run_once():
         if link in seen:
             n_seen += 1
             continue
-        path = urlparse(link).path.lower()
-        if any(part in path for part in SKIP_URL_PARTS):
+        if any(is_skipped_url(u) for u in entry_urls(entry)):
             n_skip += 1
-            seen.append(link)  # авторські колонки та подібне не публікуємо
+            seen.append(link)  # авторські колонки, проєкти тощо не публікуємо
+            print("Пропущено (розділ, який не публікуємо):", link)
             continue
         age = entry_age_hours(entry)
         if MAX_AGE_HOURS > 0 and age is not None and age > MAX_AGE_HOURS:
@@ -1322,8 +1377,15 @@ def run_once():
 
         try:
             page_ok = True
+            print("Обробляю:", link)
             try:
                 text, image, page_html = get_article(link)
+            except SkipArticle as e:
+                n_skip += 1
+                seen.append(link)
+                save_seen(seen)
+                print("Пропущено (на сторінці розділ, який не публікуємо):", link, "->", e)
+                continue
             except Exception as e:
                 page_ok = False
                 print("Сторінку не відкрито, беру текст з RSS:", link, "->", e)
