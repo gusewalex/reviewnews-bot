@@ -26,7 +26,15 @@ WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 POST_STATUS = os.environ.get("POST_STATUS", "publish")  # publish або draft
-MAX_POSTS = int(os.environ.get("MAX_POSTS", "30"))     # скільки новин за один запуск
+MAX_POSTS = int(os.environ.get("MAX_POSTS", "10"))     # скільки новин за одну перевірку
+# розділи сайту, які бот не публікує (частини адреси через кому); /columns/ = авторські колонки
+SKIP_URL_PARTS = [
+    x.strip().lower()
+    for x in (os.environ.get("SKIP_URL_PARTS") or "/columns/").split(",")
+    if x.strip()
+]
+MAX_AGE_HOURS = float(os.environ.get("MAX_AGE_HOURS", "6") or 0)  # старіші новини не публікуємо (0 = без обмеження)
+USE_SOURCE_DATE = os.environ.get("USE_SOURCE_DATE", "").strip().lower() == "true"  # ставити час публікації як у джерела
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "1200"))  # після цього нові новини не беруться
 MIN_QUOTE_LEN = int(os.environ.get("MIN_QUOTE_LEN", "15"))  # коротші фрази в лапках не вважаємо цитатами
@@ -1196,12 +1204,15 @@ def collect_entries():
     return mixed
 
 
-def write_summary(done, n_seen, n_short, errors):
+def write_summary(done, n_seen, n_short, errors, n_old=0, n_skip=0):
     """Короткий підсумок запуску на сторінці запуску в GitHub Actions."""
     lines = ["### Підсумок запуску", f"- Опубліковано: **{done}**"]
     for url, status, n in FEED_REPORT:
         lines.append(f"- Стрічка `{url}`: {status}, новин: {n}")
-    lines.append(f"- Вже оброблених пропущено: {n_seen}; занадто коротких: {n_short}")
+    lines.append(
+        f"- Вже оброблених пропущено: {n_seen}; занадто коротких: {n_short}; "
+        f"застарілих (старше {MAX_AGE_HOURS:g} год): {n_old}; пропущено за розділом (колонки тощо): {n_skip}"
+    )
     if errors:
         lines.append(f"- Помилок: **{len(errors)}**. Перша: `{errors[0][:300]}`")
     if FEED_REPORT and all(n == 0 for _u, _s, n in FEED_REPORT):
@@ -1223,6 +1234,17 @@ def rss_text(entry):
         return _clean(lxml_html.fromstring("<div>" + raw + "</div>").text_content())
     except Exception:
         return _clean(re.sub(r"<[^>]+>", " ", raw))
+
+
+def entry_age_hours(entry):
+    """Скільки годин тому новину опубліковано в джерелі (або None)."""
+    pub = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not pub:
+        return None
+    try:
+        return max(0.0, (time.time() - calendar.timegm(pub)) / 3600)
+    except Exception:
+        return None
 
 
 def entry_date_gmt(entry):
@@ -1259,7 +1281,7 @@ def run_once():
     done = 0
     FEED_REPORT.clear()
 
-    n_seen, n_short, errors = 0, 0, []
+    n_seen, n_short, n_old, n_skip, errors = 0, 0, 0, 0, []
     for entry in collect_entries():
         if done >= MAX_POSTS:
             break
@@ -1271,6 +1293,16 @@ def run_once():
             continue
         if link in seen:
             n_seen += 1
+            continue
+        path = urlparse(link).path.lower()
+        if any(part in path for part in SKIP_URL_PARTS):
+            n_skip += 1
+            seen.append(link)  # авторські колонки та подібне не публікуємо
+            continue
+        age = entry_age_hours(entry)
+        if MAX_AGE_HOURS > 0 and age is not None and age > MAX_AGE_HOURS:
+            n_old += 1
+            seen.append(link)  # застаріла новина: не публікуємо, щоб не було «пачок» старих
             continue
 
         try:
@@ -1333,7 +1365,8 @@ def run_once():
             print("Позначки:", clean_tags(data.get("tags")))
 
             post_link = create_post(
-                data, image_id, images, status, tag_ids, entry_date_gmt(entry)
+                data, image_id, images, status, tag_ids,
+                entry_date_gmt(entry) if USE_SOURCE_DATE else None
             )
             print(f"Створено ({status}):", post_link)
             seen.append(link)
@@ -1345,7 +1378,7 @@ def run_once():
 
     save_seen(seen)
     print(f"Готово. Нових матеріалів: {done}")
-    write_summary(done, n_seen, n_short, errors)
+    write_summary(done, n_seen, n_short, errors, n_old, n_skip)
 
 
 def commit_state():
