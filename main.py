@@ -503,4 +503,1120 @@ def rss_caption(entry):
 
     for key in ("media_content", "enclosures"):
         for it in entry.get(key, []) or []:
-            if isins
+            if isinstance(it, dict):
+                for k in ("credit", "description"):
+                    v = it.get(k)
+                    if isinstance(v, str):
+                        c = _caption_from_text(v)
+                        if c:
+                            cands.append(c)
+
+    htmls = []
+    for c in entry.get("content", []) or []:
+        if isinstance(c, dict) and c.get("value"):
+            htmls.append(c["value"])
+    for k in ("summary", "description"):
+        if entry.get(k):
+            htmls.append(entry[k])
+
+    for raw in htmls:
+        try:
+            doc = lxml_html.fromstring("<div>" + raw + "</div>")
+        except Exception:
+            continue
+        for fc in doc.iter("figcaption"):
+            c = _caption_from_text(_text(fc))
+            if c:
+                cands.append(c)
+        for img in doc.iter("img"):
+            for a in ("alt", "title"):
+                v = _clean(img.get(a) or "")
+                if v and len(v) <= 200 and CREDIT_START_RE.match(v):
+                    cands.append(v)
+        for el in doc.iter():
+            t = _is_credit_el(el)
+            if t:
+                cands.append(t)
+
+    for c in cands:
+        c = sanitize_caption(c)
+        if c:
+            return c
+    return None
+
+
+# ---------- Додаткові фото зі статті ----------
+SKIP_SRC = re.compile(
+    r"logo|icon|avatar|sprite|pixel|spacer|emoji|placeholder|blank|1x1|favicon|banner|/ads?/|\.svg",
+    re.I,
+)
+SKIP_CONTAINER = re.compile(
+    r"related|recommend|sidebar|comment|share|banner|widget|promo|advert"
+    r"|(?<![a-z])ads?(?![a-z])|newsletter|subscribe|popular|read-?also|also-?read|author|footer|menu",
+    re.I,
+)
+
+
+def _best_src(img):
+    """Адреса найбільшої версії картинки (враховує srcset і lazy-load)."""
+    srcset = img.get("srcset") or img.get("data-srcset")
+    if srcset:
+        best, best_w = None, -1
+        for part in srcset.split(","):
+            bits = part.strip().split()
+            if not bits:
+                continue
+            w = 0
+            if len(bits) > 1:
+                m = re.match(r"(\d+)", bits[1])
+                w = int(m.group(1)) if m else 0
+            if w > best_w:
+                best, best_w = bits[0], w
+        if best:
+            return best
+    for a in ("data-src", "data-lazy-src", "data-original", "src"):
+        v = img.get(a)
+        if v and not v.startswith("data:"):
+            return v
+    return None
+
+
+def _stem(url):
+    """Ім'я файлу без розширення й суфіксів розміру (щоб знаходити ту саму картинку)."""
+    name = url.split("?")[0].rstrip("/").split("/")[-1].lower()
+    name = re.sub(r"\.[a-z0-9]{2,5}$", "", name)
+    name = re.sub(r"[-_]\d+x\d+$", "", name)
+    name = re.sub(r"[-_](?:small|medium|large|big|thumb|orig|original|preview)$", "", name)
+    return name
+
+
+def find_article_images(html_text, page_url, exclude):
+    """Знаходить у тексті новини додаткові фото (без головного, логотипів,
+    реклами й блоків «читайте також»). Повертає список адрес."""
+    if not html_text:
+        return []
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        return []
+
+    scope = doc.xpath("//article")
+    root = scope[0] if scope else doc
+    skip_stems = {_stem(u) for u in exclude if u}
+    result = []
+
+    for img in root.iter("img"):
+        # занадто малі картинки (іконки, смайли)
+        if any(
+            (img.get(a) or "").isdigit() and int(img.get(a)) < 200
+            for a in ("width", "height")
+        ):
+            continue
+        src = _best_src(img)
+        if not src:
+            continue
+        url = urljoin(page_url, src)
+        if not url.startswith("http") or SKIP_SRC.search(url):
+            continue
+
+        # пропускаємо картинки з бокових блоків, реклами, схожих новин
+        bad = False
+        for anc in img.iterancestors():
+            if anc is root or not isinstance(anc.tag, str) or anc.tag in ("body", "html"):
+                break
+            if anc.tag in ("aside", "footer", "nav"):
+                bad = True
+                break
+            if SKIP_CONTAINER.search((anc.get("class") or "") + " " + (anc.get("id") or "")):
+                bad = True
+                break
+        if bad:
+            continue
+
+        st = _stem(url)
+        if not st or st in skip_stems:
+            continue
+        skip_stems.add(st)
+        result.append(url)
+        if len(result) >= MAX_IMAGES:
+            break
+    return result
+
+
+def entry_image(entry):
+    for key in ("media_content", "media_thumbnail"):
+        items = entry.get(key)
+        if items and items[0].get("url"):
+            return items[0]["url"]
+    for enc in entry.get("enclosures", []):
+        if enc.get("type", "").startswith("image") and enc.get("href"):
+            return enc["href"]
+    return None
+
+
+# ---------- Перевірка цитат ----------
+_n = MIN_QUOTE_LEN
+QUOTE_RE = re.compile(
+    r"«([^»]{%d,})»|„([^“”]{%d,})[“”]|“([^”]{%d,})”|\"([^\"]{%d,})\"" % (_n, _n, _n, _n)
+)
+
+# рядки-«сміття», які не є частиною новини (посилання на інші матеріали тощо)
+NOISE_RE = re.compile(
+    r"^\s*(?:читайте також|дивіться також|також читайте|читайте ще|читайте далі"
+    r"|за темою|джерело|фото|відео)\b.*$",
+    re.I | re.M,
+)
+
+
+def strip_noise(text):
+    return NOISE_RE.sub("", text)
+
+
+def norm(s):
+    """Лишає тільки літери й цифри в нижньому регістрі (ігнорує пунктуацію)."""
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"[\W_]+", " ", s.lower()).strip()
+
+
+def missing_quotes(original, rewritten):
+    """Повертає цитати з оригіналу, яких немає дослівно в новому тексті."""
+    new_norm = norm(rewritten)
+    missing = []
+    for m in QUOTE_RE.finditer(original):
+        quote = next(g for g in m.groups() if g)
+        if norm(quote) not in new_norm:
+            missing.append(quote.strip())
+    return missing
+
+
+def rewrite(title, text, extra=""):
+    user_msg = f"Заголовок: {title}\n\nТекст:\n{text[:8000]}"
+    if extra:
+        user_msg += "\n\n" + extra
+    resp = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.3,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+# ---------- Посилання на джерела в тексті ----------
+SHARE_RE = re.compile(
+    r"sharer|/share[/?]|/intent/|share\.php|addthis|^mailto:|^tel:|^javascript:|^#", re.I
+)
+CTA_RE = re.compile(
+    r"підписуйт|підписатис|підпишіть|читайте нас|наш телеграм|наш канал|приєднуйтес|слідкуйте",
+    re.I,
+)
+
+
+def _host(u):
+    return urlparse(u).netloc.lower().removeprefix("www.")
+
+
+def url_key(u):
+    """Нормалізована адреса для порівняння (без http/www, # і кінцевого /)."""
+    u = (u or "").strip().lower()
+    u = re.sub(r"^https?://", "", u)
+    u = re.sub(r"^www\.", "", u)
+    return u.split("#")[0].rstrip("/")
+
+
+def find_source_links(html_text, page_url):
+    """Зовнішні посилання на джерела в тексті статті (наприклад, «Про це пише ERR»).
+    Повертає список {anchor, url, context}. Посилання на сам сайт-джерело,
+    меню, кнопки «поділитися» та заклики підписатися пропускаються."""
+    if not html_text:
+        return []
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        return []
+
+    found = doc.xpath("//article")
+    scope = found[0] if found else doc
+    page_host = _host(page_url)
+    result, seen_keys = [], set()
+
+    for a in scope.iter("a"):
+        href = (a.get("href") or "").strip()
+        if not href or SHARE_RE.search(href):
+            continue
+        url = urljoin(page_url, href)
+        if not url.lower().startswith("http"):
+            continue
+        host = _host(url)
+        if not host or host == page_host or host.endswith("." + page_host):
+            continue
+        if any(host == h or host.endswith("." + h) for h in BLOCK_LINK_HOSTS):
+            continue  # посилання на сайти з чорного списку (Eurointegration тощо) не зберігаємо
+        anchor = _text(a)
+        if not anchor or len(anchor) > 150:
+            continue
+
+        par, bad = None, False
+        for anc in a.iterancestors():
+            if anc is scope or not isinstance(anc.tag, str) or anc.tag in ("body", "html"):
+                break
+            if anc.tag in ("aside", "footer", "nav"):
+                bad = True
+                break
+            if SKIP_CONTAINER.search((anc.get("class") or "") + " " + (anc.get("id") or "")):
+                bad = True
+                break
+            if par is None and anc.tag in ("p", "blockquote", "li"):
+                par = anc
+        if bad or par is None:
+            continue
+        context = _text(par)
+        if CTA_RE.search(context):
+            continue
+
+        key = url_key(url)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        result.append({"anchor": anchor, "url": url, "context": context[:250]})
+        if len(result) >= 8:
+            break
+    return result
+
+
+def format_links(links):
+    if not links:
+        return ""
+    lines = [
+        "Посилання з оригіналу. Кожне з них ОБОВ'ЯЗКОВО збережи в переписаному тексті "
+        'як HTML-посилання <a href="адреса" target="_blank" rel="noopener">слово або '
+        "назва, на яких воно стоїть</a> (адресу не змінюй). Згадки про те, хто повідомив "
+        "чи заявив, також залишай. Якщо в оригіналі посилання подано рядком "
+        "«Посилання: ...» чи «Джерело: ...», перепиши його розгорнутим реченням "
+        "(«За інформацією ...», «Про це повідомляє ...»), а не копіюй рядок:"
+    ]
+    for i, l in enumerate(links, 1):
+        lines.append(f"{i}. «{l['anchor']}» → {l['url']} (абзац в оригіналі: «{l['context']}»)")
+    return "\n".join(lines)
+
+
+A_TAG_RE = re.compile(r"<a\s[^>]*?href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.I | re.S)
+
+
+def clean_links(content, links):
+    """Лишає тільки посилання, що були в оригіналі (вигадані прибирає, текст лишає)."""
+    allowed = {url_key(l["url"]) for l in links}
+
+    def repl(m):
+        href = m.group(1)
+        if href.lower().startswith("http") and url_key(href) in allowed:
+            return m.group(0)
+        return m.group(2)
+
+    return A_TAG_RE.sub(repl, content)
+
+
+def missing_links(links, content):
+    present = {url_key(m.group(1)) for m in A_TAG_RE.finditer(content)}
+    return [l for l in links if url_key(l["url"]) not in present]
+
+
+def add_missing_links(content, missing):
+    """Втрачені посилання додаємо розгорнутим реченням («За інформацією ...»)
+    другим абзацом статті, а не рядком «Посилання: ...» в кінці."""
+    items = [
+        f'<a href="{escape(l["url"])}" target="_blank" rel="noopener">{escape(l["anchor"])}</a>'
+        for l in missing
+    ]
+    joined = items[0] if len(items) == 1 else ", ".join(items[:-1]) + " та " + items[-1]
+    sentence = f"<p>За інформацією {joined}.</p>"
+    i = content.lower().find("</p>")
+    if i == -1:
+        return sentence + "\n" + content
+    i += len("</p>")
+    return content[:i] + "\n" + sentence + content[i:]
+
+
+def add_target_blank(content):
+    """Посилання відкриваються в новій вкладці."""
+    return re.sub(r"<a\s+(?![^>]*\btarget=)", '<a target="_blank" rel="noopener" ', content, flags=re.I)
+
+
+# ---------- Дослівні цитати: підставляємо оригінал у готовий текст ----------
+QUOTE_SUB_RE = re.compile(
+    r"«([^»\n]{%d,600})»|„([^“”\n]{%d,600})[“”]|“([^”\n]{%d,600})”|\"([^\"\n]{%d,600})\""
+    % (MIN_QUOTE_LEN, MIN_QUOTE_LEN, MIN_QUOTE_LEN, MIN_QUOTE_LEN)
+)
+MARK_RE = re.compile(r"\[\[\s*Q(\d+)\s*\]\]", re.I)
+WRAPPED_MARK_RE = re.compile(r"[«„“\"]\s*(\[\[\s*Q\d+\s*\]\])\s*[»“”\"]", re.I)
+
+
+def mask_quotes(text):
+    """Замінює прямі цитати маркерами [[Q1]], [[Q2]]...
+    Повертає (текст з маркерами, список оригінальних цитат разом з лапками)."""
+    quotes = []
+
+    def repl(m):
+        quotes.append(m.group(0))
+        return f"[[Q{len(quotes)}]]"
+
+    return QUOTE_SUB_RE.sub(repl, text), quotes
+
+
+def unmask_quotes(content, quotes):
+    """Підставляє замість маркерів точні оригінальні цитати.
+    Повертає (текст, множина використаних номерів)."""
+    content = WRAPPED_MARK_RE.sub(r"\1", content)  # GPT міг додати лапки навколо маркера
+    used = set()
+
+    def repl(m):
+        i = int(m.group(1))
+        if 1 <= i <= len(quotes):
+            used.add(i)
+            return escape(quotes[i - 1], quote=False)  # дослівно, як в оригіналі
+        return ""
+
+    return MARK_RE.sub(repl, content), used
+
+
+def sentence_with(text, quote):
+    """Речення з оригіналу, в якому стоїть цитата (разом з тим, хто її сказав)."""
+    i = text.find(quote)
+    if i < 0:
+        return quote
+    start = max(text.rfind(". ", 0, i), text.rfind("\n", 0, i)) + 1
+    ends = [e for e in (text.find(". ", i + len(quote)), text.find("\n", i + len(quote))) if e != -1]
+    end = min(ends) + 1 if ends else len(text)
+    return text[start:end].strip()[:700]
+
+
+# ---------- Видалення згадок видання-джерела («Європейська правда» тощо) ----------
+OUTLET_NAMES = [
+    "Українська правда. Життя", "Українська правда", "Української правди",
+    "Європейська правда", "Європейської правди", "Економічна правда",
+    "Економічної правди", "Європравда",
+    "www.eurointegration.com.ua", "eurointegration.com.ua", "Eurointegration",
+    "www.suspilne.media", "suspilne.media",
+    "www.epravda.com.ua", "epravda.com.ua",
+    "www.sport.nv.ua", "sport.nv.ua", "www.nv.ua", "nv.ua", "NV", "НВ",
+    "NV Sport", "NV Спорт", "НВ Спорт", "Sport.NV",
+]
+BLOCKED_URL_RE = re.compile(
+    r"https?://(?:[\w-]+\.)*(?:" + "|".join(re.escape(h) for h in BLOCK_LINK_HOSTS) + r")\S*", re.I
+)
+_OUT = "(?:" + "|".join(
+    r"(?<!\w)" + re.escape(n) + r"(?!\w)" for n in sorted(OUTLET_NAMES, key=len, reverse=True)
+) + ")"
+OUTLET_REF = (
+    r"(?:(?:видання|ресурс|портал|сайт)[ \t]+)?[«„“\"]?[ \t]*" + _OUT + r"(?:[ \t]*[»”“\"])?"
+)
+OUTLET_ANY_RE = re.compile(_OUT, re.I)
+_VERBS = (
+    r"(?:інформує|повідомляє|пише|передає|розповідає|зазначає|наводить|цитує"
+    r"|інформують|повідомляють|пишуть)"
+)
+_VIA = r"(?:з посиланням на|із посиланням на|посилаючись на)"
+
+# «повідомляє Європейська правда з посиланням на Bloomberg» -> «повідомляє Bloomberg»
+RULE_A = re.compile(r"(" + _VERBS + r")[ \t]+" + OUTLET_REF + r"[ \t]+" + _VIA + r"[ \t]+", re.I)
+# окреме речення «Про це інформує Європейська правда.» -> прибрати
+RULE_F = re.compile(
+    r"(?:(?<=[.!?])[ \t]+|^)Про це[ \t]+" + _VERBS + r"[ \t]+" + OUTLET_REF + r"[ \t]*\.",
+    re.I | re.M,
+)
+# «..., інформує Європейська правда» -> прибрати
+RULE_B = re.compile(r"(?:[,;][ \t]*|[ \t]+)(?:як[ \t]+)?" + _VERBS + r"[ \t]+" + OUTLET_REF, re.I)
+# «Європейська правда» у лапках без дієслова -> просто назва (її приб'є GPT)
+RULE_E = re.compile(r"[«„“\"][ \t]*(" + _OUT + r")[ \t]*[»”“\"]", re.I)
+
+
+def clean_outlet_text(text):
+    t = BLOCKED_URL_RE.sub("", text)  # голі адреси сайтів з чорного списку
+    t = RULE_A.sub(r"\1 ", t)
+    t = RULE_F.sub("", t)
+    t = RULE_B.sub("", t)
+    return RULE_E.sub(r"\1", t)
+
+
+def brand_from_url(url):
+    """bloomberg.com -> Bloomberg"""
+    parts = _host(url).split(".")
+    if len(parts) >= 3 and parts[-2] in ("co", "com", "org", "net"):
+        base = parts[-3]
+    elif len(parts) >= 2:
+        base = parts[-2]
+    else:
+        base = parts[0]
+    return base.capitalize()
+
+
+def fix_outlet_links(links):
+    """Якщо посилання стоїть на назві видання-джерела («Європейська правда» -> bloomberg.com),
+    переносимо його на назву першоджерела (Bloomberg)."""
+    for l in links:
+        l["context"] = clean_outlet_text(l["context"])
+        anchor = l["anchor"].strip(" «»„“”\"")
+        if re.fullmatch(_OUT, anchor, re.I):
+            brand = brand_from_url(l["url"])
+            m = re.search(re.escape(brand), l["context"], re.I)
+            l["anchor"] = m.group(0) if m else brand
+    return links
+
+
+def outlet_mentions(content):
+    plain = re.sub(r"<[^>]+>", " ", content)
+    return sorted({m.group(0) for m in OUTLET_ANY_RE.finditer(plain)})
+
+
+def final_outlet_cleanup(content):
+    """Страховка: прибирає згадки видання-джерела, що лишилися в готовому HTML."""
+    def repl(m):
+        inner = re.sub(r"<[^>]+>", "", m.group(2)).strip(" «»„“”\"")
+        if re.fullmatch(_OUT, inner, re.I):
+            prefix = m.group(0)[: m.start(2) - m.start(0)]
+            return prefix + escape(brand_from_url(m.group(1))) + "</a>"
+        return m.group(0)
+
+    c = A_TAG_RE.sub(repl, content)
+    c = clean_outlet_text(c)
+    # «<a>Bloomberg</a> з посиланням на Bloomberg» -> «<a>Bloomberg</a>»
+    c = re.sub(r"(<a\s[^>]*>([^<]+)</a>)\s+(?:з посиланням на|із посиланням на|посилаючись на)\s+\2", r"\1", c)
+    return re.sub(r"<p>\s*Про це\s*\.\s*</p>\s*", "", c)
+
+
+def rewrite_checked(title, text, links=None):
+    """Переписує новину. Прямі цитати та посилання на джерела гарантовано
+    переносяться з оригіналу без змін. Повертає (дані, статус_публікації)."""
+    links = links or []
+    text = strip_noise(text)  # прибираємо «читайте також» тощо до переписування
+    text = clean_outlet_text(text)  # прибираємо згадки видання-джерела до маскування цитат
+    links = fix_outlet_links(links)
+    masked, quotes = mask_quotes(text)  # цитати йдуть до GPT як маркери
+    notes = format_links(links)
+    if quotes:
+        notes += (
+            "\n\nПрямі цитати в тексті замінено маркерами "
+            + ", ".join(f"[[Q{i}]]" for i in range(1, len(quotes) + 1))
+            + ". Використай кожен маркер у новині точно як є."
+        )
+
+    def attempt(extra):
+        d = rewrite(title, masked, extra)
+        content, used = unmask_quotes(d["content"], quotes)
+        d["content"] = clean_links(content, links)
+        for k in ("title", "excerpt"):
+            d[k] = MARK_RE.sub("", d.get(k) or "").strip()
+        return d, used
+
+    data, used = attempt(notes)
+    miss_q = [i for i in range(1, len(quotes) + 1) if i not in used]
+    miss_l = missing_links(links, data["content"])
+    miss_o = outlet_mentions(data["content"])
+
+    if miss_q or miss_l or miss_o:
+        extra = notes
+        if miss_o:
+            print("У тексті згадано видання-джерело, пробую ще раз:", miss_o)
+            extra += (
+                "\n\nУ попередній спробі лишилася згадка видання-джерела: "
+                + ", ".join(f"«{x}»" for x in miss_o)
+                + ". Прибери її (правило 11), залишивши лише першоджерело."
+            )
+        if miss_q:
+            print("Не використано цитати, пробую ще раз:", [f"Q{i}" for i in miss_q])
+            extra += (
+                "\n\nУ попередній спробі не було використано маркери: "
+                + ", ".join(f"[[Q{i}]]" for i in miss_q)
+                + ". Кожен маркер має бути в тексті обов'язково, поруч із тим, хто це сказав."
+            )
+        if miss_l:
+            print("Втрачено посилання, пробую ще раз:", [l["url"] for l in miss_l])
+            extra += (
+                "\n\nУ попередній спробі було втрачено ці посилання. Збережи їх "
+                "обов'язково як <a href=...> на відповідному слові:\n- "
+                + "\n- ".join(f"«{l['anchor']}» → {l['url']}" for l in miss_l)
+            )
+        data, used = attempt(extra)
+        miss_q = [i for i in range(1, len(quotes) + 1) if i not in used]
+        miss_l = missing_links(links, data["content"])
+
+    data["content"] = final_outlet_cleanup(data["content"])
+    for k in ("title", "excerpt"):
+        data[k] = clean_outlet_text(data.get(k) or "")
+    if outlet_mentions(data["content"]):
+        print("Увага: у тексті лишилася згадка видання-джерела:", outlet_mentions(data["content"]))
+
+    if miss_q:  # гарантія: цитата не втрачається, додаємо її речення з оригіналу дослівно
+        added = []
+        for i in miss_q:
+            sent = sentence_with(text, quotes[i - 1])
+            if sent not in added:
+                added.append(sent)
+        print("Цитати додано дослівно з оригіналу:", len(miss_q))
+        data["content"] += "".join(f"\n<p>{escape(x, quote=False)}</p>" for x in added)
+    if miss_l:  # гарантія: посилання не втрачаються
+        print("Посилання додано другим абзацом:", [l["url"] for l in miss_l])
+        data["content"] = add_missing_links(data["content"], miss_l)
+    data["content"] = add_target_blank(data["content"])
+    return data, POST_STATUS
+
+
+def upload_image(url):
+    """Завантажує картинку у WordPress, повертає (ID, адреса на вашому сайті)."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
+        ext = {"image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get(ctype, "jpg")
+        resp = requests.post(
+            f"{WP_URL}/wp-json/wp/v2/media",
+            auth=auth,
+            headers={
+                "Content-Disposition": f'attachment; filename="news.{ext}"',
+                "Content-Type": ctype,
+            },
+            data=r.content,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        j = resp.json()
+        return j["id"], j.get("source_url")
+    except Exception as e:
+        print("Картинку не завантажено:", e)
+        return None, None
+
+
+def build_figure(image_url, caption, alt):
+    # підпис лише той, що знайдено на сайті-джерелі; немає підпису, немає й рядка
+    figcaption = f"<figcaption>{escape(caption)}</figcaption>" if caption else ""
+    return (
+        '<figure class="wp-block-image size-large">'
+        f'<img src="{escape(image_url)}" alt="{escape(alt)}"/>'
+        f"{figcaption}"
+        "</figure>"
+    )
+
+
+UNIT_RE = re.compile(r"(<blockquote\b.*?</blockquote>|<p\b.*?</p>)", re.S | re.I)
+def insert_figures(content, figures):
+    """Перше (головне) фото завжди на самому початку статті, перед першим абзацом.
+    Додаткові фото: після 3-го, 5-го, 7-го... абзацу (якщо абзаців менше, у кінець)."""
+    if not figures:
+        return content
+    first, rest = figures[0], figures[1:]
+    parts = UNIT_RE.split(content)
+    n_par = sum(1 for i in range(1, len(parts), 2) if parts[i].lower().startswith("<p"))
+    if n_par == 0:
+        return "\n".join(figures) + "\n" + content
+
+    slots = [3, 5, 7, 9, 11]
+    fig_at = {}
+    for k, fig in enumerate(rest):
+        n = slots[k] if k < len(slots) else n_par
+        fig_at.setdefault(min(n, n_par), []).append(fig)
+
+    out, count = [first + "\n"], 0
+    for i, part in enumerate(parts):
+        out.append(part)
+        if i % 2 == 1 and part.lower().startswith("<p"):
+            count += 1
+            for fig in fig_at.get(count, []):
+                out.append("\n" + fig + "\n")
+    return "".join(out)
+
+
+def clean_tags(raw):
+    """Лишає до 3 унікальних позначок великими літерами."""
+    tags = []
+    for t in raw or []:
+        t = re.sub(r"[#,]", " ", str(t))
+        t = re.sub(r"\s+", " ", t).strip().upper()
+        if t and t not in tags:
+            tags.append(t)
+    return tags[:3]
+
+
+def get_tag_ids(names):
+    """Знаходить або створює позначки у WordPress, повертає їхні ID."""
+    ids = []
+    for name in clean_tags(names):
+        try:
+            r = requests.get(
+                f"{WP_URL}/wp-json/wp/v2/tags",
+                auth=auth,
+                params={"search": name, "per_page": 20},
+                timeout=30,
+            )
+            r.raise_for_status()
+            found = next(
+                (t["id"] for t in r.json() if t["name"].strip().upper() == name), None
+            )
+            if found is None:
+                r = requests.post(
+                    f"{WP_URL}/wp-json/wp/v2/tags",
+                    auth=auth,
+                    json={"name": name},
+                    timeout=30,
+                )
+                if r.status_code == 400 and r.json().get("code") == "term_exists":
+                    found = r.json()["data"]["term_id"]
+                else:
+                    r.raise_for_status()
+                    found = r.json()["id"]
+            if found not in ids:
+                ids.append(found)
+        except Exception as e:
+            print("Позначку не додано:", name, "->", e)
+    return ids
+
+
+_CATEGORY_CACHE = {}
+
+
+def get_category_id(name):
+    """Знаходить категорію WordPress за назвою (регістр не важливий) або створює її."""
+    key = name.strip().upper()
+    if key in _CATEGORY_CACHE:
+        return _CATEGORY_CACHE[key]
+    cid = None
+    try:
+        r = requests.get(
+            f"{WP_URL}/wp-json/wp/v2/categories",
+            auth=auth,
+            params={"search": name, "per_page": 50},
+            timeout=30,
+        )
+        r.raise_for_status()
+        for c in r.json():
+            if unescape(c["name"]).strip().upper() == key:
+                cid = c["id"]
+                break
+        if cid is None:
+            r = requests.post(
+                f"{WP_URL}/wp-json/wp/v2/categories", auth=auth, json={"name": name}, timeout=30
+            )
+            if r.status_code == 400 and r.json().get("code") == "term_exists":
+                cid = r.json()["data"]["term_id"]
+            else:
+                r.raise_for_status()
+                cid = r.json()["id"]
+    except Exception as e:
+        print("Категорію не знайдено й не створено:", name, "->", e)
+    if cid is not None:
+        _CATEGORY_CACHE[key] = cid
+    return cid
+
+
+# ---------- Відео YouTube ----------
+YT_ID = r"[A-Za-z0-9_-]{11}"
+YT_URL_RES = [
+    re.compile(r"youtube(?:-nocookie)?\.com/(?:embed|shorts|live|v)/(" + YT_ID + r")(?![\w-])", re.I),
+    re.compile(r"youtube(?:-nocookie)?\.com/watch\?[^\s\"'<>]*?\bv=(" + YT_ID + r")(?![\w-])", re.I),
+    re.compile(r"youtu\.be/(" + YT_ID + r")(?![\w-])", re.I),
+]
+YT_ID_ATTRS = ("data-video-id", "data-videoid", "videoid", "data-youtube-id", "data-yt-id")
+YT_URL_ATTRS = ("src", "data-src", "data-lazy-src", "href", "data-url", "data-embed", "data-video-url")
+
+
+def youtube_id(text):
+    """Ідентифікатор відео з адреси YouTube (embed, watch, youtu.be, shorts) або None."""
+    for rx in YT_URL_RES:
+        m = rx.search(text or "")
+        if m and m.group(1) != "videoseries":  # videoseries = плейлист, не відео
+            return m.group(1)
+    return None
+
+
+def find_youtube_ids(html_text, page_url=""):
+    """Відео YouTube у тексті статті (iframe, lazy-load, посилання, lite-youtube)."""
+    if not html_text:
+        return []
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        return []
+    found = doc.xpath("//article")
+    scope = found[0] if found else doc
+    ids = []
+    for el in scope.iter():
+        if not isinstance(el.tag, str) or el.tag in ("script", "style"):
+            continue
+        cands = []
+        for a in YT_URL_ATTRS:
+            v = el.get(a)
+            if v:
+                cands.append(youtube_id(v))
+        for a in YT_ID_ATTRS:
+            v = (el.get(a) or "").strip()
+            if re.fullmatch(YT_ID, v):
+                cands.append(v)
+        cands = [c for c in cands if c]
+        if not cands:
+            continue
+        # пропускаємо відео з блоків «читайте також», реклами, бічних колонок
+        bad = False
+        for anc in el.iterancestors():
+            if anc is scope or not isinstance(anc.tag, str) or anc.tag in ("body", "html"):
+                break
+            if anc.tag in ("aside", "footer", "nav"):
+                bad = True
+                break
+            if SKIP_CONTAINER.search((anc.get("class") or "") + " " + (anc.get("id") or "")):
+                bad = True
+                break
+        if bad:
+            continue
+        for c in cands:
+            if c not in ids:
+                ids.append(c)
+    return ids[:MAX_VIDEOS] if MAX_VIDEOS > 0 else []
+
+
+def youtube_ids_from_entry(entry):
+    """Запасний варіант: відео YouTube з самого RSS-запису (iframe/посилання в описі)."""
+    raws = []
+    for c in entry.get("content", []) or []:
+        if isinstance(c, dict) and c.get("value"):
+            raws.append(c["value"])
+    for k in ("summary", "description"):
+        if entry.get(k):
+            raws.append(entry[k])
+    ids = []
+    for raw in raws:
+        for rx in YT_URL_RES:
+            for m in rx.finditer(raw):
+                if m.group(1) != "videoseries" and m.group(1) not in ids:
+                    ids.append(m.group(1))
+    return ids[:MAX_VIDEOS] if MAX_VIDEOS > 0 else []
+
+
+def build_youtube_embed(vid):
+    """Блок «YouTube» редактора WordPress (WordPress сам показує відеоплеєр)."""
+    url = f"https://www.youtube.com/watch?v={vid}"
+    return (
+        '<!-- wp:embed {"url":"' + url + '","type":"video","providerNameSlug":"youtube",'
+        '"responsive":true,"className":"wp-embed-aspect-16-9 wp-has-aspect-ratio"} -->\n'
+        '<figure class="wp-block-embed is-type-video is-provider-youtube wp-block-embed-youtube '
+        'wp-embed-aspect-16-9 wp-has-aspect-ratio"><div class="wp-block-embed__wrapper">\n'
+        + url + '\n</div></figure>\n<!-- /wp:embed -->'
+    )
+
+
+def insert_videos(content, embeds):
+    """Відео ставимо одразу після другого абзацу (після блоку з джерелом);
+    якщо абзаців менше, у кінець статті."""
+    if not embeds:
+        return content
+    parts = UNIT_RE.split(content)
+    out, count, done = [], 0, False
+    for i, part in enumerate(parts):
+        out.append(part)
+        if i % 2 == 1 and part.lower().startswith("<p"):
+            count += 1
+            if count == 2 and not done:
+                out.append("\n" + "\n".join(embeds) + "\n")
+                done = True
+    if not done:
+        out.append("\n" + "\n".join(embeds) + "\n")
+    return "".join(out)
+
+
+def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None):
+    """images: список (адреса фото на вашому сайті, підпис або None);
+    videos: список ідентифікаторів відео YouTube."""
+    figures = [build_figure(u, c, data["title"]) for u, c in images]
+    content = insert_figures(data["content"], figures)
+    content = insert_videos(content, [build_youtube_embed(v) for v in (videos or [])])
+    payload = {
+        "title": data["title"],
+        "content": content,
+        "excerpt": data.get("excerpt", ""),
+        "status": status,
+    }
+    if image_id:
+        payload["featured_media"] = image_id
+    if tag_ids:
+        payload["tags"] = tag_ids
+    if category_ids:
+        payload["categories"] = category_ids
+    if date_gmt:
+        payload["date_gmt"] = date_gmt  # час публікації як у джерела
+    resp = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", auth=auth, json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json().get("link")
+
+
+def fetch_feed(feed_url):
+    """Читає RSS-стрічку. Повертає (список новин, статус для звіту)."""
+    entries, status = [], "?"
+    try:
+        r = requests.get(feed_url, headers=HEADERS, timeout=30)
+        status = f"HTTP {r.status_code}"
+        if r.status_code == 200:
+            entries = list(feedparser.parse(r.content).entries)
+    except Exception as e:
+        status = f"помилка: {e}"
+    if not entries:  # запасний спосіб читання
+        try:
+            entries = list(feedparser.parse(feed_url, agent=HEADERS["User-Agent"]).entries)
+        except Exception:
+            pass
+    return entries, status
+
+
+def collect_entries():
+    """Збирає новини з усіх джерел, чергуючи їх (по одній з кожного),
+    щоб одне джерело не займало весь ліміт за запуск."""
+    per_feed = []
+    for feed_url in FEEDS:
+        entries, status = fetch_feed(feed_url)
+        FEED_REPORT.append((feed_url, status, len(entries)))
+        print(f"{feed_url}: {status}, новин у стрічці: {len(entries)}")
+        if not entries:
+            print("ПРОБЛЕМА: стрічка порожня або недоступна (можливо, сайт блокує запити з GitHub)")
+        for e in entries:
+            try:
+                e["_feed"] = feed_url  # з якої стрічки новина (для категорій)
+            except Exception:
+                pass
+        per_feed.append(entries[:MAX_ENTRIES])
+
+    mixed = []
+    for i in range(MAX_ENTRIES):
+        for entries in per_feed:
+            if i < len(entries):
+                mixed.append(entries[i])
+    return mixed
+
+
+def write_summary(done, n_seen, n_short, errors, n_old=0, n_skip=0):
+    """Короткий підсумок запуску на сторінці запуску в GitHub Actions."""
+    lines = ["### Підсумок запуску", f"- Опубліковано: **{done}**"]
+    for url, status, n in FEED_REPORT:
+        lines.append(f"- Стрічка `{url}`: {status}, новин: {n}")
+    lines.append(
+        f"- Вже оброблених пропущено: {n_seen}; занадто коротких: {n_short}; "
+        f"застарілих (старше {MAX_AGE_HOURS:g} год): {n_old}; пропущено за розділом (колонки тощо): {n_skip}"
+    )
+    if errors:
+        lines.append(f"- Помилок: **{len(errors)}**. Перша: `{errors[0][:300]}`")
+    if FEED_REPORT and all(n == 0 for _u, _s, n in FEED_REPORT):
+        lines.append("- **ПРОБЛЕМА:** жодна стрічка не віддала новин (сайт блокує запити або стрічка змінилась)")
+    text = "\n".join(lines)
+    print(text)
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+
+
+def rss_text(entry):
+    """Короткий текст новини з самої RSS-стрічки (запасний варіант)."""
+    raw = entry.get("summary") or entry.get("description") or ""
+    if not raw:
+        return ""
+    try:
+        return _clean(lxml_html.fromstring("<div>" + raw + "</div>").text_content())
+    except Exception:
+        return _clean(re.sub(r"<[^>]+>", " ", raw))
+
+
+def entry_age_hours(entry):
+    """Скільки годин тому новину опубліковано в джерелі (або None)."""
+    pub = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not pub:
+        return None
+    try:
+        return max(0.0, (time.time() - calendar.timegm(pub)) / 3600)
+    except Exception:
+        return None
+
+
+def entry_date_gmt(entry):
+    """Час публікації новини в джерелі (UTC) або None."""
+    pub = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not pub:
+        return None
+    try:
+        if calendar.timegm(pub) > time.time():  # дата з майбутнього: ігноруємо
+            return None
+        return time.strftime("%Y-%m-%dT%H:%M:%S", pub)
+    except Exception:
+        return None
+
+
+def mark_seen_only():
+    """Службовий режим: позначаємо всі поточні новини зі стрічок як оброблені,
+    нічого не публікуючи (щоб не з'являлися дублі)."""
+    seen = load_seen()
+    added = 0
+    for entry in collect_entries():
+        link = entry.get("link")
+        if link and link not in seen:
+            seen.append(link)
+            added += 1
+    save_seen(seen)
+    print(f"Позначено як оброблені: {added} новин. Нічого не опубліковано.")
+
+
+def run_once():
+    """Одна перевірка стрічок: нові новини переписуються й публікуються."""
+    started = time.time()
+    seen = load_seen()
+    done = 0
+    FEED_REPORT.clear()
+
+    n_seen, n_short, n_old, n_skip, errors = 0, 0, 0, 0, []
+    for entry in collect_entries():
+        if done >= MAX_POSTS:
+            break
+        if time.time() - started > MAX_RUN_SECONDS:
+            print("Час запуску вичерпано, решту новин оброблю наступного разу")
+            break
+        link = entry.get("link")
+        if not link:
+            continue
+        if link in seen:
+            n_seen += 1
+            continue
+        if any(is_skipped_url(u) for u in entry_urls(entry)):
+            n_skip += 1
+            seen.append(link)  # авторські колонки, проєкти тощо не публікуємо
+            print("Пропущено (розділ, який не публікуємо):", link)
+            continue
+        age = entry_age_hours(entry)
+        if MAX_AGE_HOURS > 0 and age is not None and age > MAX_AGE_HOURS:
+            n_old += 1
+            seen.append(link)  # застаріла новина: не публікуємо, щоб не було «пачок» старих
+            continue
+
+        try:
+            page_ok = True
+            print("Обробляю:", link)
+            try:
+                text, image, page_html = get_article(link)
+            except SkipArticle as e:
+                n_skip += 1
+                seen.append(link)
+                save_seen(seen)
+                print("Пропущено (на сторінці розділ, який не публікуємо):", link, "->", e)
+                continue
+            except Exception as e:
+                page_ok = False
+                print("Сторінку не відкрито, беру текст з RSS:", link, "->", e)
+                text, image, page_html = "", None, ""
+
+            if len(text) < 300:  # якщо зі сторінки текст не витягнувся, беремо з RSS
+                alt = rss_text(entry)
+                if len(alt) > len(text):
+                    text = alt
+            if len(text) < MIN_TEXT:  # дуже короткий текст: додаємо заголовок новини
+                text = (entry.get("title", "") + ". " + text).strip(" .")
+            if len(text) < MIN_TEXT:
+                print("Занадто короткий текст, пропускаю:", link)
+                n_short += 1
+                seen.append(link)
+                save_seen(seen)
+                continue
+
+            links = find_source_links(page_html, link) if page_ok else []
+            if links:
+                print("Посилання на джерела в оригіналі:", [(l["anchor"], l["url"]) for l in links])
+            data, status = rewrite_checked(entry.get("title", ""), text, links)
+
+            image_id, images = None, []
+            img_url = image or entry_image(entry)
+            if img_url:
+                image_id, wp_url = upload_image(img_url)
+                caption = sanitize_caption(rss_caption(entry))
+                cap_src = "RSS"
+                if not caption:
+                    caption = sanitize_caption(
+                        find_photo_caption(page_html, img_url, is_main=True)
+                    )
+                    cap_src = "сторінка новини"
+                print(
+                    "Підпис до головного фото:",
+                    f"{caption} (знайдено: {cap_src})" if caption else f"(підпису на сайті-джерелі не знайдено, фото без підпису: {link})",
+                )
+                if not caption and page_html:
+                    print("ДІАГНОСТИКА, HTML навколо фото:", debug_image_context(page_html, img_url))
+                if wp_url:
+                    images.append((wp_url, caption))
+
+            # додаткові фото зі статті
+            for extra in find_article_images(page_html, link, [img_url, image]):
+                _, wp_url = upload_image(extra)
+                if not wp_url:
+                    continue
+                cap = sanitize_caption(find_photo_caption(page_html, extra))
+                print("Додаткове фото:", extra, "| підпис:", cap or "(не знайдено, без підпису)")
+                images.append((wp_url, cap))
+
+            video_ids = find_youtube_ids(page_html, link) if page_ok else []
+            if not video_ids:
+                video_ids = youtube_ids_from_entry(entry)
+            if video_ids:
+                print("Відео YouTube в оригіналі:", video_ids)
+
+            tag_ids = get_tag_ids(data.get("tags"))
+            print("Позначки:", clean_tags(data.get("tags")))
+
+            cat_name = FEED_CATEGORIES.get(entry.get("_feed"))
+            category_ids = []
+            if cat_name:
+                cid = get_category_id(cat_name)
+                if cid:
+                    category_ids = [cid]
+                print("Категорія:", cat_name if cid else f"{cat_name} (не вдалося, без категорії)")
+
+            post_link = create_post(
+                data, image_id, images, status, tag_ids,
+                entry_date_gmt(entry) if USE_SOURCE_DATE else None,
+                category_ids,
+                video_ids,
+            )
+            print(f"Створено ({status}):", post_link)
+            seen.append(link)
+            save_seen(seen)  # зберігаємо одразу, щоб не було дублів при збої
+            done += 1
+        except Exception as e:
+            print("Помилка з новиною", link, "->", e)
+            errors.append(f"{link} -> {e}")
+
+    save_seen(seen)
+    print(f"Готово. Нових матеріалів: {done}")
+    write_summary(done, n_seen, n_short, errors, n_old, n_skip)
+
+
+def commit_state():
+    """У GitHub Actions: зберігаємо seen.json у репозиторії між перевірками."""
+    if os.environ.get("GITHUB_ACTIONS") and os.path.exists("save_seen.py"):
+        try:
+            subprocess.run([sys.executable, "save_seen.py"], timeout=180)
+        except Exception as e:
+            print("Не вдалося зберегти список оброблених новин:", e)
+
+
+def main():
+    if MARK_SEEN_ONLY:
+        mark_seen_only()
+        return
+    start = time.time()
+    while True:
+        run_once()
+        if RUN_LOOP_MINUTES <= 0:
+            break
+        commit_state()
+        remaining = RUN_LOOP_MINUTES * 60 - (time.time() - start)
+        if remaining < POLL_SECONDS + 120:
+            break
+        print(f"Наступна перевірка через {POLL_SECONDS // 60} хв...")
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
