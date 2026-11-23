@@ -42,12 +42,17 @@ SKIP_URL_PARTS = [
     for x in (os.environ.get("SKIP_URL_PARTS") or "/columns/,/articles/,/opinion/").split(",")
     if x.strip()
 ]
-# сайти, на які бот не робить посилань і назви яких прибирає з тексту
-BLOCK_LINK_HOSTS = [
-    x.strip().lower()
-    for x in (os.environ.get("BLOCK_LINK_HOSTS") or "eurointegration.com.ua,epravda.com.ua,nv.ua").split(",")
-    if x.strip()
-]
+# сайти, на які бот не робить посилань і назви яких прибирає з тексту:
+# завжди заблоковані сайти + те, що додано через змінну середовища
+_BASE_BLOCK = {"pravda.com.ua", "eurointegration.com.ua", "epravda.com.ua", "nv.ua"}
+BLOCK_LINK_HOSTS = sorted(
+    _BASE_BLOCK
+    | {
+        x.strip().lower().removeprefix("www.")
+        for x in (os.environ.get("BLOCK_LINK_HOSTS") or "").split(",")
+        if x.strip()
+    }
+)
 MAX_AGE_HOURS = float(os.environ.get("MAX_AGE_HOURS", "6") or 0)  # старіші новини не публікуємо (0 = без обмеження)
 USE_SOURCE_DATE = os.environ.get("USE_SOURCE_DATE", "").strip().lower() == "true"  # ставити час публікації як у джерела
 MAX_ENTRIES = int(os.environ.get("MAX_ENTRIES", "60")) # скільки останніх новин читати з кожної стрічки
@@ -140,6 +145,20 @@ PROMPT = """Ти досвідчений редактор українськог�
     підмета й дієслова. Рядки «Посилання: ...» з оригіналу не копіюй, а
     переформулюй у речення за цим зразком.
     Далі: решта подій і деталей новини.
+
+13. ДЖЕРЕЛА В СОЦМЕРЕЖАХ: якщо посилання веде в Telegram, Facebook, X (Twitter),
+    Instagram, YouTube, TikTok чи іншу мережу, у реченні про джерело ОБОВ'ЯЗКОВО
+    вкажи: (а) хто саме повідомляє (прізвище й посада, назва відомства, каналу чи
+    видання) і (б) в якій мережі. Посилання став на назву того, хто повідомляє, а
+    НЕ на слова «повідомив», «написав», «заявив», «тут». Хто саме, бери з абзацу
+    в оригіналі, а якщо там не сказано, то з назви акаунта в адресі.
+    Приклади:
+    «Про це повідомила <a href="...">Київська міська військова адміністрація</a> у Telegram.»
+    «Про це написав <a href="...">Віталій Кім</a> у Telegram.»
+    «Про це повідомив голова ОВА <a href="...">Олександр Ганжа</a> у Facebook.»
+    ЗАБОРОНЕНО: «За інформацією повідомив та написав.» і будь-які речення, де
+    посилання стоїть лише на дієслові. Якщо кілька посилань ведуть на один акаунт,
+    назви його один раз, а решту дописів познач словами «допис 2», «допис 3».
 
 Поверни JSON з полями:
 - "title": новий інформативний заголовок до 90 символів, без клікбейту і
@@ -401,13 +420,15 @@ def _sibling_caption(img):
 
 
 def _matching_imgs(doc, image_url):
-    name = (image_url or "").split("?")[0].rstrip("/").split("/")[-1]
-    if len(name) < 5:
+    stem = _stem(image_url or "")  # ім'я файлу без розширення й суфіксів розміру
+    if len(stem) < 5:
         return []
-    return [
-        img for img in doc.iter("img")
-        if name in " ".join(img.get(a) or "" for a in IMG_ATTRS)
-    ]
+    res = []
+    for img in doc.iter("img"):
+        val = " ".join(img.get(a) or "" for a in IMG_ATTRS + ("data-original",)).lower()
+        if stem in val:
+            res.append(img)
+    return res
 
 
 def debug_image_context(html_text, image_url):
@@ -423,6 +444,50 @@ def debug_image_context(html_text, image_url):
         return lxml_html.tostring(node, encoding="unicode")[:900]
     except Exception as e:
         return f"(не вдалося: {e})"
+
+
+def _walk(o):
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from _walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _walk(v)
+
+
+def _jsonld_caption(doc, image_url, is_main):
+    """Підпис до фото з розмітки JSON-LD (ImageObject), якщо його немає в HTML."""
+    stem = _stem(image_url or "")
+    fallback = None
+    for s in doc.xpath('//script[@type="application/ld+json"]/text()'):
+        try:
+            data = json.loads(s)
+        except Exception:
+            continue
+        for d in _walk(data):
+            t = d.get("@type")
+            types = t if isinstance(t, list) else [t]
+            if "ImageObject" not in types:
+                continue
+            url = d.get("url") or d.get("contentUrl") or ""
+            matched = bool(stem) and isinstance(url, str) and stem in url.lower()
+            cap = d.get("caption") or (d.get("description") if matched else "")
+            cap = _clean(cap) if isinstance(cap, str) else ""
+            credit = d.get("creditText")
+            if not isinstance(credit, str):
+                credit = ""
+            credit = _clean(credit)
+            text = cap
+            if credit and credit.lower() not in cap.lower():
+                text = (cap + ". " if cap else "") + "Фото: " + credit
+            if not text:
+                continue
+            if matched:
+                return text
+            if is_main and fallback is None:
+                fallback = text
+    return fallback
 
 
 def find_photo_caption(html_text, image_url, is_main=False):
@@ -486,6 +551,19 @@ def find_photo_caption(html_text, image_url, is_main=False):
                     return t
         else:
             return credits[0][1]
+
+    # 5) JSON-LD (ImageObject)
+    c = _jsonld_caption(doc, image_url, is_main)
+    if c:
+        return c
+
+    # 6) Головне фото: перший непорожній figcaption у статті
+    if is_main:
+        scope = doc.xpath("//article") or [doc]
+        for fc in scope[0].iter("figcaption"):
+            c = _caption_from_text(_text(fc))
+            if c:
+                return c
     return None
 
 
@@ -727,10 +805,92 @@ def url_key(u):
     return u.split("#")[0].rstrip("/")
 
 
+# ---------- Соцмережі: хто саме повідомляє і де ----------
+SOCIAL_NETS = {
+    "t.me": ("Telegram", "у"), "telegram.me": ("Telegram", "у"),
+    "facebook.com": ("Facebook", "у"), "fb.com": ("Facebook", "у"), "fb.watch": ("Facebook", "у"),
+    "x.com": ("X", "в"), "twitter.com": ("X", "в"),
+    "instagram.com": ("Instagram", "в"),
+    "youtube.com": ("YouTube", "на"), "youtu.be": ("YouTube", "на"),
+    "tiktok.com": ("TikTok", "у"), "threads.net": ("Threads", "у"), "threads.com": ("Threads", "у"),
+    "linkedin.com": ("LinkedIn", "у"), "truthsocial.com": ("Truth Social", "у"),
+    "bsky.app": ("Bluesky", "у"),
+}
+NET_ALIASES = {
+    "Telegram": r"telegram|телеграм\w*",
+    "Facebook": r"facebook|фейсбук\w*",
+    "X": r"(?<!\w)x(?!\w)|twitter|твіттер\w*",
+    "Instagram": r"instagram|інстаграм\w*",
+    "YouTube": r"youtube|ютуб\w*",
+    "TikTok": r"tiktok|тікток\w*",
+    "Threads": r"threads",
+    "LinkedIn": r"linkedin",
+    "Truth Social": r"truth\s*social",
+    "Bluesky": r"bluesky",
+}
+NET_WORD_RE = re.compile(
+    r"(?<!\w)(?:telegram|телеграм\w*|facebook|фейсбук\w*|твіттер\w*|twitter|instagram|інстаграм\w*"
+    r"|threads|tiktok|youtube|ютуб\w*|x)(?!\w)", re.I)
+GENERIC_WORD_RE = re.compile(
+    r"(?:повідом\w*|написа\w*|заяв\w*|інформ\w*|зазнач\w*|розпові\w*|уточн\w*|пише\w*|каже|тут"
+    r"|джерело|посилання|публікаці\w*|допис\w*|пост\w*|повідомленн\w*|відео|фото|це"
+    r"|у|в|на|за|та|і|й|свої\w*|акаунт\w*|канал\w*|сторінк\w*|сторінц\w*|соцмереж\w*|мереж\w*)",
+    re.I)
+SUBJ_RE = re.compile(
+    r"(?:повідом\w+|написа\w+|заяв\w+|інформ\w+|зазнач\w+|розпові\w+|уточн\w+|додал\w+|пише\w*)\s+"
+    r"(.{3,90}?)"
+    r"(?=\s+(?:у|в|на|через)\s+(?:своє\w*\s+)?(?:telegram|телеграм|facebook|фейсбук|x|twitter|твіттер"
+    r"|instagram|інстаграм|threads|tiktok|youtube|акаунт|сторінц|канал|соцмереж)|[,.;:]|$)",
+    re.I)
+
+
+def social_network(url):
+    h = _host(url)
+    for k, v in SOCIAL_NETS.items():
+        if h == k or h.endswith("." + k):
+            return v
+    return None
+
+
+def social_handle(url):
+    segs = [s for s in urlparse(url).path.split("/") if s]
+    if segs and segs[0] == "s":
+        segs = segs[1:]
+    if not segs or segs[0].lower() in {
+        "share", "intent", "profile.php", "watch", "i", "web", "hashtag", "channel", "c", "user", "status"
+    }:
+        return ""
+    if _host(url).endswith(("youtube.com", "youtu.be")):
+        return ""
+    return segs[0].lstrip("@")
+
+
+def is_generic_anchor(anchor):
+    """«повідомив», «написав та повідомив», «у Telegram», «тут» тощо, тобто текст без назви джерела."""
+    a = NET_WORD_RE.sub(" ", (anchor or "").lower().strip(" «»„“”\".,:;"))
+    words = [w for w in re.split(r"[\s,]+", a) if w]
+    return all(GENERIC_WORD_RE.fullmatch(w) for w in words)
+
+
+def source_label(anchor, url, context):
+    """Назва джерела для посилання. Якщо якір це дієслово («повідомив»), шукаємо, хто саме."""
+    if not is_generic_anchor(anchor):
+        return anchor
+    net = social_network(url)
+    if not net:
+        return brand_from_url(url)
+    m = SUBJ_RE.search(context or "")
+    if m:
+        who = NET_WORD_RE.sub("", m.group(1)).strip(" ,.;:«»„“”\"")
+        if 3 <= len(who) <= 90 and not is_generic_anchor(who):
+            return who
+    return social_handle(url) or net[0]
+
+
 def find_source_links(html_text, page_url):
     """Зовнішні посилання на джерела в тексті статті (наприклад, «Про це пише ERR»).
-    Повертає список {anchor, url, context}. Посилання на сам сайт-джерело,
-    меню, кнопки «поділитися» та заклики підписатися пропускаються."""
+    Повертає список {anchor, url, context, network, prep, handle}. Посилання на сам
+    сайт-джерело, меню, кнопки «поділитися» та заклики підписатися пропускаються."""
     if not html_text:
         return []
     try:
@@ -754,7 +914,7 @@ def find_source_links(html_text, page_url):
         if not host or host == page_host or host.endswith("." + page_host):
             continue
         if any(host == h or host.endswith("." + h) for h in BLOCK_LINK_HOSTS):
-            continue  # посилання на сайти з чорного списку (Eurointegration тощо) не зберігаємо
+            continue  # посилання на сайти з чорного списку (pravda.com.ua тощо) не зберігаємо
         anchor = _text(a)
         if not anchor or len(anchor) > 150:
             continue
@@ -781,7 +941,15 @@ def find_source_links(html_text, page_url):
         if key in seen_keys:
             continue
         seen_keys.add(key)
-        result.append({"anchor": anchor, "url": url, "context": context[:250]})
+        net = social_network(url)
+        result.append({
+            "anchor": source_label(anchor, url, context),
+            "url": url,
+            "context": context[:250],
+            "network": net[0] if net else "",
+            "prep": net[1] if net else "",
+            "handle": social_handle(url) if net else "",
+        })
         if len(result) >= 8:
             break
     return result
@@ -799,7 +967,8 @@ def format_links(links):
         "(«За інформацією ...», «Про це повідомляє ...»), а не копіюй рядок:"
     ]
     for i, l in enumerate(links, 1):
-        lines.append(f"{i}. «{l['anchor']}» → {l['url']} (абзац в оригіналі: «{l['context']}»)")
+        net = f" [соцмережа: {l['network']}; акаунт: {l['handle'] or 'невідомо'}]" if l.get("network") else ""
+        lines.append(f"{i}. «{l['anchor']}» → {l['url']}{net} (абзац в оригіналі: «{l['context']}»)")
     return "\n".join(lines)
 
 
@@ -807,14 +976,17 @@ A_TAG_RE = re.compile(r"<a\s[^>]*?href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.I
 
 
 def clean_links(content, links):
-    """Лишає тільки посилання, що були в оригіналі (вигадані прибирає, текст лишає)."""
+    """Лишає тільки посилання з оригіналу (вигадані прибирає). Посилання на дієсловах
+    («повідомив», «написав», «тут») теж знімає: їх додасть коректне речення про джерело."""
     allowed = {url_key(l["url"]) for l in links}
 
     def repl(m):
-        href = m.group(1)
+        href, inner = m.group(1), m.group(2)
         if href.lower().startswith("http") and url_key(href) in allowed:
+            if is_generic_anchor(re.sub(r"<[^>]+>", "", inner)):
+                return inner
             return m.group(0)
-        return m.group(2)
+        return inner
 
     return A_TAG_RE.sub(repl, content)
 
@@ -824,20 +996,77 @@ def missing_links(links, content):
     return [l for l in links if url_key(l["url"]) not in present]
 
 
+def _a(url, text):
+    return f'<a href="{escape(url)}" target="_blank" rel="noopener">{escape(text)}</a>'
+
+
+def _and(items):
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " та " + items[-1]
+
+
 def add_missing_links(content, missing):
-    """Втрачені посилання додаємо розгорнутим реченням («За інформацією ...»)
-    другим абзацом статті, а не рядком «Посилання: ...» в кінці."""
-    items = [
-        f'<a href="{escape(l["url"])}" target="_blank" rel="noopener">{escape(l["anchor"])}</a>'
-        for l in missing
-    ]
-    joined = items[0] if len(items) == 1 else ", ".join(items[:-1]) + " та " + items[-1]
-    sentence = f"<p>За інформацією {joined}.</p>"
+    """Втрачені посилання додаємо розгорнутим реченням другим абзацом:
+    «Про це повідомляє <a>КМВА</a> у Telegram.» (соцмережі), «За інформацією <a>ERR</a>.» (решта)."""
+    soc, other, channels = [], [], {}
+    for l in missing:
+        if l.get("network"):
+            ch = (l["network"], (l.get("handle") or l["anchor"]).lower())
+            if ch in channels:
+                channels[ch]["extra"].append(l["url"])  # той самий акаунт: ще один допис
+                continue
+            item = {"html": _a(l["url"], l["anchor"]), "net": l["network"],
+                    "prep": l.get("prep", "у"), "anchor": l["anchor"], "extra": []}
+            channels[ch] = item
+            soc.append(item)
+        else:
+            other.append(_a(l["url"], l["anchor"]))
+
+    def soc_text(it):
+        s = it["html"]
+        if it["anchor"].lower() != it["net"].lower():
+            s += f" {it['prep']} {escape(it['net'])}"
+        if it["extra"]:
+            s += " (" + ", ".join(_a(u, f"допис {i}") for i, u in enumerate(it["extra"], 2)) + ")"
+        return s
+
+    parts = []
+    if soc:
+        parts.append("Про це повідомляє " + _and([soc_text(i) for i in soc]))
+    if other:
+        parts.append("За інформацією " + _and(other))
+    sentence = "<p>" + ". ".join(parts) + ".</p>"
     i = content.lower().find("</p>")
     if i == -1:
         return sentence + "\n" + content
     i += len("</p>")
     return content[:i] + "\n" + sentence + content[i:]
+
+
+def ensure_network(content, links):
+    """Якщо посилання веде в соцмережу, а в абзаці її не названо, додає «у Telegram» тощо."""
+    meta = {url_key(l["url"]): l for l in links if l.get("network")}
+    if not meta:
+        return content
+
+    def fix_par(pm):
+        par = pm.group(0)
+        plain = re.sub(r"<[^>]+>", " ", par)
+        done = set()
+
+        def repl(m):
+            l = meta.get(url_key(m.group(1)))
+            if not l or l["network"] in done:
+                return m.group(0)
+            alias = NET_ALIASES.get(l["network"], re.escape(l["network"]))
+            if re.search(alias, plain, re.I):
+                done.add(l["network"])
+                return m.group(0)
+            done.add(l["network"])
+            return m.group(0) + f" {l['prep']} {l['network']}"
+
+        return A_TAG_RE.sub(repl, par)
+
+    return UNIT_RE.sub(fix_par, content)
 
 
 def add_target_blank(content):
@@ -898,6 +1127,7 @@ OUTLET_NAMES = [
     "Українська правда. Життя", "Українська правда", "Української правди",
     "Європейська правда", "Європейської правди", "Економічна правда",
     "Економічної правди", "Європравда",
+    "www.pravda.com.ua", "pravda.com.ua",
     "www.eurointegration.com.ua", "eurointegration.com.ua", "Eurointegration",
     "www.suspilne.media", "suspilne.media",
     "www.epravda.com.ua", "epravda.com.ua",
@@ -905,7 +1135,10 @@ OUTLET_NAMES = [
     "NV Sport", "NV Спорт", "НВ Спорт", "Sport.NV",
 ]
 BLOCKED_URL_RE = re.compile(
-    r"https?://(?:[\w-]+\.)*(?:" + "|".join(re.escape(h) for h in BLOCK_LINK_HOSTS) + r")\S*", re.I
+    r"(?<![\w.-])(?:https?://)?(?:www\.)?(?:[\w-]+\.)*(?:"
+    + "|".join(re.escape(h) for h in BLOCK_LINK_HOSTS)
+    + r")(?:/[^\s<>\"'«»]*)?(?![\w-])",
+    re.I,
 )
 _OUT = "(?:" + "|".join(
     r"(?<!\w)" + re.escape(n) + r"(?!\w)" for n in sorted(OUTLET_NAMES, key=len, reverse=True)
@@ -971,8 +1204,26 @@ def outlet_mentions(content):
     return sorted({m.group(0) for m in OUTLET_ANY_RE.finditer(plain)})
 
 
+def drop_blocked_links(content):
+    """Прибирає <a> на заблоковані сайти. Якщо текст посилання це домен чи назва видання,
+    прибирає його повністю, інакше лишає тільки текст."""
+    def repl(m):
+        href = m.group(1)
+        h = _host(href) if href.lower().startswith("http") else ""
+        if h and any(h == b or h.endswith("." + b) for b in BLOCK_LINK_HOSTS):
+            inner = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            if DOMAIN_RE.fullmatch(inner) or re.fullmatch(_OUT, inner.strip(" «»„“”\""), re.I):
+                return ""
+            return m.group(2)
+        return m.group(0)
+
+    return A_TAG_RE.sub(repl, content)
+
+
 def final_outlet_cleanup(content):
     """Страховка: прибирає згадки видання-джерела, що лишилися в готовому HTML."""
+    content = drop_blocked_links(content)
+
     def repl(m):
         inner = re.sub(r"<[^>]+>", "", m.group(2)).strip(" «»„“”\"")
         if re.fullmatch(_OUT, inner, re.I):
@@ -1036,7 +1287,8 @@ def rewrite_checked(title, text, links=None):
             print("Втрачено посилання, пробую ще раз:", [l["url"] for l in miss_l])
             extra += (
                 "\n\nУ попередній спробі було втрачено ці посилання. Збережи їх "
-                "обов'язково як <a href=...> на відповідному слові:\n- "
+                "обов'язково як <a href=...> на назві того, хто повідомляє "
+                "(не на дієслові), із вказівкою мережі:\n- "
                 + "\n- ".join(f"«{l['anchor']}» → {l['url']}" for l in miss_l)
             )
         data, used = attempt(extra)
@@ -1044,6 +1296,7 @@ def rewrite_checked(title, text, links=None):
         miss_l = missing_links(links, data["content"])
 
     data["content"] = final_outlet_cleanup(data["content"])
+    data["content"] = ensure_network(data["content"], links)
     for k in ("title", "excerpt"):
         data[k] = clean_outlet_text(data.get(k) or "")
     if outlet_mentions(data["content"]):
