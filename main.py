@@ -266,6 +266,20 @@ for _f in FEEDS:  # назви й домени джерел з FEEDS теж за
         SITE_NAMES.add(_host)
         SITE_NAMES.add(_host.split(".")[0])
 
+# Заборонені домени: сайти з чорного списку + домени стрічок FEEDS.
+# Решта доменів у підписах (наприклад facebook.com/Alexanderusyk) лишається.
+_BLOCKED_HOSTS = set(BLOCK_LINK_HOSTS)
+for _f in FEEDS:
+    _h = urlparse(_f).netloc.lower().removeprefix("www.")
+    if _h:
+        _BLOCKED_HOSTS.add(_h)
+BLOCKED_DOMAIN_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:[\w-]+\.)*(?:"
+    + "|".join(re.escape(h) for h in sorted(_BLOCKED_HOSTS, key=len, reverse=True))
+    + r")(?:/[^\s)\]]*)?",
+    re.I,
+)
+
 DOMAIN_RE = re.compile(
     r"(?:https?://|www\.)\S+|\b(?:[a-z0-9-]+\.)+(?:ua|com|net|org|info|ru|eu|tv|io|media|news)\b",
     re.I,
@@ -283,38 +297,35 @@ def has_site_name(text):
 
 
 def is_site_part(text):
-    """True, якщо фрагмент підпису це сайт/домен або назва сайту-джерела."""
-    return bool(DOMAIN_RE.search(text)) or has_site_name(text)
+    """True, якщо фрагмент підпису містить заборонений сайт або назву сайту-джерела."""
+    return bool(BLOCKED_DOMAIN_RE.search(text)) or has_site_name(text)
 
 
 def sanitize_caption(caption):
-    """Прибирає з підпису сайти як джерела.
+    """Прибирає з підпису лише сайти-джерела (pravda.com.ua, nv.ua тощо).
+    'Олександр Усик із дружиною (Фото: facebook.com/Alexanderusyk)' -> без змін;
     'Фото: pravda.com.ua' -> None;
-    'Фото: Запорізька ОВА / pravda.com.ua' -> 'Фото: Запорізька ОВА';
-    'наслідки атаки, фото ОВА' -> без змін;
-    'наслідки атаки, фото pravda.com.ua' -> 'наслідки атаки'."""
+    'Фото: Запорізька ОВА / pravda.com.ua' -> 'Фото: Запорізька ОВА'."""
     caption = _clean(caption)
     if not caption:
         return None
+    if not is_site_part(caption):
+        return caption  # немає заборонених сайтів: підпис лишається повним
     prefix, sep, rest = caption.partition(":")
     if not sep:
-        if not is_site_part(caption):
-            return caption
         names = "|".join(re.escape(n) for n in SITE_NAMES)
         cleaned = re.sub(
             r"[,.;]?\s*(?:ілюстративне\s+)?(?:фото|скріншот)\s*:?\s*[«\"]?(?:"
-            + DOMAIN_RE.pattern + "|" + names + r")[»\"]?",
+            + BLOCKED_DOMAIN_RE.pattern + "|" + names + r")[»\"]?",
             "", caption, flags=re.I,
         )
         cleaned = _clean(cleaned).strip(" ,;.")
         return None if (not cleaned or is_site_part(cleaned)) else cleaned
-    rest2 = DOMAIN_RE.sub(" / ", rest)  # адреси й домени вирізаємо одразу
-    parts = [x.strip() for x in re.split(r"\s*[/|;,]\s*", rest2) if x.strip()]
+    rest2 = BLOCKED_DOMAIN_RE.sub(" / ", rest)
+    parts = [x.strip() for x in re.split(r"\s*(?:\s/\s|[|;,])\s*", rest2) if x.strip()]
     good = [x for x in parts if not has_site_name(x)]
     if not good:
         return None
-    if rest2 == rest and len(good) == len(parts):
-        return caption
     return f"{prefix.strip()}: {', '.join(good)}"
 
 
@@ -334,7 +345,9 @@ IMG_ATTRS = ("src", "data-src", "data-lazy-src", "srcset", "data-srcset")
 
 
 def _text(el):
-    return _clean(" ".join(el.itertext()))
+    t = _clean(" ".join(el.itertext()))
+    t = re.sub(r"\(\s+", "(", t)  # без пробілу після «(»
+    return re.sub(r"\s+([)\].,;:!?])", r"\1", t)  # і перед «)», розділовими знаками
 
 
 def looks_like_caption(t):
@@ -359,6 +372,42 @@ def _is_credit_el(el):
     return t
 
 
+def _caption_parts(parent, img):
+    """Тексти всіх елементів-підписів у контейнері (без вкладених дублів)."""
+    hits = []
+    for el in parent.iter():
+        if el is img or not isinstance(el.tag, str) or el.tag in ("script", "style"):
+            continue
+        cls = (el.get("class") or "") + " " + (el.get("id") or "")
+        if el.tag == "figcaption" or CAPTION_HINT.search(cls):
+            hits.append(el)
+    hs = set(hits)
+    texts = []
+    for el in hits:
+        if any(a in hs for a in el.iterancestors()):
+            continue
+        t = _text(el)
+        if t and t not in texts:
+            texts.append(t)
+    return texts
+
+
+def _join_caption(texts):
+    """Опис + джерело: 'Опис (Фото: джерело)'."""
+    if not texts:
+        return None
+    main = texts[0]
+    for t in texts[1:]:
+        if t.lower() in main.lower():
+            continue
+        if CREDIT_START_RE.match(t):
+            t = f"({t})"
+        elif len(t) <= 60:
+            t = f"(Фото: {t})"
+        main = f"{main} {t}"
+    return main if len(main) <= 300 else _caption_from_text(main)
+
+
 def _structural_caption(img):
     """Підпис, що за будовою сторінки належить саме цьому фото:
     figcaption, блок з класом caption/descr..., або найменший контейнер
@@ -372,20 +421,9 @@ def _structural_caption(img):
             break
         if len(parent.xpath(".//img")) > 1:
             break  # у блоці кілька фото: підпис неоднозначний
-        if parent.tag == "figure":
-            fc = parent.find(".//figcaption")
-            if fc is not None:
-                c = _caption_from_text(_text(fc))
-                if c:
-                    return c
-        for el in parent.iter():
-            if el is img or not isinstance(el.tag, str):
-                continue
-            cls = (el.get("class") or "") + " " + (el.get("id") or "")
-            if el.tag == "figcaption" or CAPTION_HINT.search(cls):
-                c = _caption_from_text(_text(el))
-                if c:
-                    return c
+        c = _join_caption(_caption_parts(parent, img))
+        if c:
+            return c
         t = _text(parent)
         if (
             t
@@ -1546,15 +1584,16 @@ def youtube_ids_from_entry(entry):
     return ids[:MAX_VIDEOS] if MAX_VIDEOS > 0 else []
 
 
-def build_youtube_embed(vid):
-    """Блок «YouTube» редактора WordPress (WordPress сам показує відеоплеєр)."""
-    url = f"https://www.youtube.com/watch?v={vid}"
+def build_youtube_embed(vid, title=""):
+    """Вбудований iframe YouTube (розмір завжди 840x480)."""
     return (
-        '<!-- wp:embed {"url":"' + url + '","type":"video","providerNameSlug":"youtube",'
-        '"responsive":true,"className":"wp-embed-aspect-16-9 wp-has-aspect-ratio"} -->\n'
-        '<figure class="wp-block-embed is-type-video is-provider-youtube wp-block-embed-youtube '
-        'wp-embed-aspect-16-9 wp-has-aspect-ratio"><div class="wp-block-embed__wrapper">\n'
-        + url + '\n</div></figure>\n<!-- /wp:embed -->'
+        "<!-- wp:html -->\n"
+        f'<iframe width="840" height="480" src="https://www.youtube.com/embed/{vid}" '
+        f'title="{escape(title, quote=True)}" frameborder="0" '
+        'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; '
+        'picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" '
+        "allowfullscreen></iframe>\n"
+        "<!-- /wp:html -->"
     )
 
 
@@ -1582,7 +1621,7 @@ def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, cat
     videos: список ідентифікаторів відео YouTube."""
     figures = [build_figure(u, c, data["title"]) for u, c in images]
     content = insert_figures(data["content"], figures)
-    content = insert_videos(content, [build_youtube_embed(v) for v in (videos or [])])
+    content = insert_videos(content, [build_youtube_embed(v, data["title"]) for v in (videos or [])])
     payload = {
         "title": data["title"],
         "content": content,
@@ -1784,13 +1823,15 @@ def run_once():
             img_url = image or entry_image(entry)
             if img_url:
                 image_id, wp_url = upload_image(img_url)
-                caption = sanitize_caption(rss_caption(entry))
-                cap_src = "RSS"
-                if not caption:
-                    caption = sanitize_caption(
-                        find_photo_caption(page_html, img_url, is_main=True)
-                    )
-                    cap_src = "сторінка новини"
+                rss_c = sanitize_caption(rss_caption(entry))
+                page_c = sanitize_caption(
+                    find_photo_caption(page_html, img_url, is_main=True)
+                ) if page_html else None
+                # повний підпис зі сторінки (з джерелом у дужках) має перевагу над обрізаним з RSS
+                if page_c and (not rss_c or (norm(rss_c) in norm(page_c) and len(page_c) > len(rss_c))):
+                    caption, cap_src = page_c, "сторінка новини"
+                else:
+                    caption, cap_src = rss_c, "RSS"
                 print(
                     "Підпис до головного фото:",
                     f"{caption} (знайдено: {cap_src})" if caption else f"(підпису на сайті-джерелі не знайдено, фото без підпису: {link})",
