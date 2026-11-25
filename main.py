@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from html import escape, unescape
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote
 
 import feedparser
 import requests
@@ -32,6 +32,10 @@ WP_URL = os.environ["WP_URL"].rstrip("/")
 WP_USER = os.environ["WP_USER"]
 WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+# базова адреса сторінок позначок і скільки ключових слів робити посиланнями
+TAG_BASE_URL = (os.environ.get("TAG_BASE_URL") or (WP_URL + "/tag")).rstrip("/")
+KEYWORD_LINKS = int(os.environ.get("KEYWORD_LINKS", "2") or 0)
 
 POST_STATUS = os.environ.get("POST_STATUS", "publish")  # publish або draft
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "10"))     # скільки новин за одну перевірку
@@ -160,12 +164,24 @@ PROMPT = """Ти досвідчений редактор українськог�
     посилання стоїть лише на дієслові. Якщо кілька посилань ведуть на один акаунт,
     назви його один раз, а решту дописів познач словами «допис 2», «допис 3».
 
+14. КЛЮЧОВІ СЛОВА-ПОСИЛАННЯ: вибери в готовому тексті 2 найважливіші слова чи
+    словосполучення: власна назва, прізвище, установа, місто чи регіон
+    (наприклад «Зеленський», «Верховна Рада», «на Полтавщині»).
+    Для кожного вкажи:
+    - "anchor": ТОЧНО так, як воно написане в твоєму "content" (з тим самим
+      відмінком і прийменником, якщо він є), від 1 до 3 слів;
+    - "tag": базова форма в називному відмінку, великими літерами
+      (Полтавщині -> ПОЛТАВА, Верховної Ради -> ВЕРХОВНА РАДА). Це ОБОВ'ЯЗКОВО
+      одна з 3 позначок з поля "tags".
+    Не бери слова, які вже є посиланнями, і назви видань-джерел.
+
 Поверни JSON з полями:
 - "title": новий інформативний заголовок до 90 символів, без клікбейту і
   без лапок-ялинок на початку,
 - "content": текст новини у HTML (кожен абзац у <p>),
 - "excerpt": короткий опис в 1-2 речення,
-- "tags": список із 3 позначок, великими літерами.
+- "tags": список із 3 позначок, великими літерами,
+- "keywords": [{"anchor": "на Полтавщині", "tag": "ПОЛТАВА"}, {"anchor": "Зеленський", "tag": "ЗЕЛЕНСЬКИЙ"}].
 """
 
 
@@ -1276,6 +1292,56 @@ def final_outlet_cleanup(content):
     return re.sub(r"<p>\s*Про це\s*\.\s*</p>\s*", "", c)
 
 
+# ---------- Ключові слова як посилання на сторінки позначок ----------
+def tag_slug(tag):
+    """ЗЕЛЕНСЬКИЙ -> зеленський, ВЕРХОВНА РАДА -> верховна-рада"""
+    s = re.sub(r"[’'ʼ`]", "", tag.strip().lower())
+    return re.sub(r"\s+", "-", s)
+
+
+def _link_first(content, anchor, href):
+    """Робить посиланням перше входження anchor у звичайному тексті
+    (поза <a> та іншими тегами). Повертає (HTML, чи_вдалося)."""
+    pat = re.compile(r"(?<!\w)" + re.escape(escape(anchor, quote=False)) + r"(?!\w)", re.I)
+    tokens = re.split(r"(<a\b.*?</a>|<[^>]+>)", content, flags=re.S | re.I)
+    for i, tok in enumerate(tokens):
+        if i % 2 == 1 or not tok:  # непарні елементи: теги й готові посилання
+            continue
+        m = pat.search(tok)
+        if m:
+            tokens[i] = tok[: m.start()] + f'<a href="{escape(href)}">{m.group(0)}</a>' + tok[m.end():]
+            return "".join(tokens), True
+    return content, False
+
+
+def apply_keyword_links(data):
+    """Лінкує до KEYWORD_LINKS ключових слів на сторінки позначок сайту."""
+    tags = clean_tags(data.get("tags"))
+    linked = 0
+    for kw in data.get("keywords") or []:
+        if linked >= KEYWORD_LINKS:
+            break
+        if not isinstance(kw, dict):
+            continue
+        anchor = _clean(str(kw.get("anchor") or "")).strip(" «»„“”\".,;:")
+        tag_list = clean_tags([kw.get("tag")])
+        if not anchor or not tag_list or len(anchor) > 60 or OUTLET_ANY_RE.fullmatch(anchor):
+            continue
+        tag = tag_list[0]
+        href = f"{TAG_BASE_URL}/{quote(tag_slug(tag))}"
+        content, ok = _link_first(data["content"], anchor, href)
+        if not ok and anchor.lower() != tag.lower():  # запасний варіант: саме слово позначки
+            content, ok = _link_first(data["content"], tag, href)
+        if ok:
+            data["content"] = content
+            linked += 1
+            if tag not in tags:
+                tags.append(tag)  # щоб сторінка позначки існувала
+    data["tags"] = tags
+    if linked:
+        print("Ключові слова-посилання:", linked)
+
+
 def rewrite_checked(title, text, links=None):
     """Переписує новину. Прямі цитати та посилання на джерела гарантовано
     переносяться з оригіналу без змін. Повертає (дані, статус_публікації)."""
@@ -1352,6 +1418,7 @@ def rewrite_checked(title, text, links=None):
         print("Посилання додано другим абзацом:", [l["url"] for l in miss_l])
         data["content"] = add_missing_links(data["content"], miss_l)
     data["content"] = add_target_blank(data["content"])
+    apply_keyword_links(data)  # після add_target_blank: внутрішні посилання відкриваються в тій самій вкладці
     return data, POST_STATUS
 
 
@@ -1419,15 +1486,15 @@ def insert_figures(content, figures):
     return "".join(out)
 
 
-def clean_tags(raw):
-    """Лишає до 3 унікальних позначок великими літерами."""
+def clean_tags(raw, limit=5):
+    """Лишає унікальні позначки великими літерами."""
     tags = []
     for t in raw or []:
         t = re.sub(r"[#,]", " ", str(t))
         t = re.sub(r"\s+", " ", t).strip().upper()
         if t and t not in tags:
             tags.append(t)
-    return tags[:3]
+    return tags[:limit]
 
 
 def get_tag_ids(names):
