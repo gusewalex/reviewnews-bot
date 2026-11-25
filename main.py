@@ -649,6 +649,14 @@ def is_getty_image(html_text, image_url):
     return False
 
 
+def main_photo_is_getty(page_html, img_url, *captions):
+    """Головне фото від Getty Images: перевіряємо сторінку, адресу та всі підписи
+    (зі сторінки й з RSS)."""
+    if is_getty_image(page_html, img_url):
+        return True
+    return any(GETTY_RE.search(c or "") for c in captions)
+
+
 def rss_caption(entry):
     """Підпис до фото, який є безпосередньо в RSS-записі новини
     (media:credit, підписи в описі, alt зображення тощо)."""
@@ -1436,12 +1444,15 @@ def build_figure(image_url, caption, alt):
 
 
 UNIT_RE = re.compile(r"(<blockquote\b.*?</blockquote>|<p\b.*?</p>)", re.S | re.I)
-def insert_figures(content, figures):
+def insert_figures(content, figures, has_main=True):
     """Перше (головне) фото завжди на самому початку статті, перед першим абзацом.
     Додаткові фото: після 3-го, 5-го, 7-го... абзацу (якщо абзаців менше, у кінець)."""
     if not figures:
         return content
-    first, rest = figures[0], figures[1:]
+    if has_main:
+        first, rest = figures[0], figures[1:]
+    else:  # головне фото лише на обкладинці: усі фото в тілі йдуть як додаткові
+        first, rest = "", list(figures)
     parts = UNIT_RE.split(content)
     n_par = sum(1 for i in range(1, len(parts), 2) if parts[i].lower().startswith("<p"))
     if n_par == 0:
@@ -1453,7 +1464,7 @@ def insert_figures(content, figures):
         n = slots[k] if k < len(slots) else n_par
         fig_at.setdefault(min(n, n_par), []).append(fig)
 
-    out, count = [first + "\n"], 0
+    out, count = ([first + "\n"] if first else []), 0
     for i, part in enumerate(parts):
         out.append(part)
         if i % 2 == 1 and part.lower().startswith("<p"):
@@ -1660,11 +1671,11 @@ def insert_videos(content, embeds):
     return "".join(out)
 
 
-def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None):
+def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None, main_in_body=True):
     """images: список (адреса фото на вашому сайті, підпис або None);
     videos: список ідентифікаторів відео YouTube."""
     figures = [build_figure(u, c, data["title"]) for u, c in images]
-    content = insert_figures(data["content"], figures)
+    content = insert_figures(data["content"], figures, has_main=main_in_body)
     content = insert_videos(content, [build_youtube_embed(v, data["title"]) for v in (videos or [])])
     payload = {
         "title": data["title"],
@@ -1863,7 +1874,7 @@ def run_once():
                 print("Посилання на джерела в оригіналі:", [(l["anchor"], l["url"]) for l in links])
             data, status = rewrite_checked(entry.get("title", ""), text, links)
 
-            image_id, images = None, []
+            image_id, images, main_in_body = None, [], True
             img_url = image or entry_image(entry)
             if img_url:
                 image_id, wp_url = upload_image(img_url)
@@ -1882,11 +1893,14 @@ def run_once():
                 )
                 if not caption and page_html:
                     print("ДІАГНОСТИКА, HTML навколо фото:", debug_image_context(page_html, img_url))
-                if wp_url:
+                if main_photo_is_getty(page_html, img_url, caption, rss_c, page_c):
+                    # Getty Images: фото лише на обкладинці (featured_media), у тіло статті не вставляємо
+                    main_in_body = False
+                    print("Головне фото від Getty Images: лише обкладинка, у тіло не вставляю:", img_url)
+                elif wp_url:
                     images.append((wp_url, caption))
 
-            # додаткові фото зі статті (фото Getty Images сюди не потрапляють;
-            # головне фото вище лишається як є, навіть якщо воно від Getty Images)
+            # додаткові фото зі статті (фото Getty Images сюди не потрапляють)
             for extra in find_article_images(page_html, link, [img_url, image]):
                 if is_getty_image(page_html, extra):
                     print("Пропущено фото Getty Images (не вставляємо в статтю):", extra)
@@ -1920,6 +1934,7 @@ def run_once():
                 entry_date_gmt(entry) if USE_SOURCE_DATE else None,
                 category_ids,
                 video_ids,
+                main_in_body,
             )
             print(f"Створено ({status}):", post_link)
             seen.append(link)
