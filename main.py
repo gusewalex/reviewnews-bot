@@ -19,6 +19,7 @@ FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
     "https://epravda.com.ua/rss/news/",
     "https://nv.ua/ukr/rss/2371.xml",
+    "https://nv.ua/rss/154.xml",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
