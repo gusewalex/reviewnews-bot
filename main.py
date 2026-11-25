@@ -145,6 +145,12 @@ PROMPT = """Ти досвідчений редактор українськог�
     підмета й дієслова. Рядки «Посилання: ...» з оригіналу не копіюй, а
     переформулюй у речення за цим зразком.
     Далі: решта подій і деталей новини.
+    Абзац із джерелом ЗАВЖДИ другий. НІКОЛИ не став його останнім і не став
+    після інших деталей. Це стосується й таких речень:
+    «Про це повідомляє <a href="...">Sun Boxing</a> на YouTube.»
+    «Про це повідомляє <a href="...">dpa</a>.»
+    «Про це пише <a href="...">Reuters</a>.»
+    «Про це свідчить <a href="...">дослідження</a> компанії Gradus.»
 
 13. ДЖЕРЕЛА В СОЦМЕРЕЖАХ: якщо посилання веде в Telegram, Facebook, X (Twitter),
     Instagram, YouTube, TikTok чи іншу мережу, у реченні про джерело ОБОВ'ЯЗКОВО
@@ -1159,6 +1165,50 @@ def ensure_network(content, links):
     return UNIT_RE.sub(fix_par, content)
 
 
+# ---------- Абзац із джерелом завжди другий ----------
+SOURCE_PAR_RE = re.compile(
+    r"^(?:(?:Також\s+)?про\s+це(?:\s+також)?\s+(?!не\b)(?:[\w'’ʼ-]+\s+){0,2}?"
+    r"(?:повідом|пише|писал|написа|свідч|йдеться|інформ|розпові|зазнач|заяв|уточн|додал)\w*"
+    r"|за\s+інформацією|за\s+повідомленням|це\s+повідомляє"
+    r"|повідомляє|повідомляють|інформує|пише|джерело)(?![\w-])",
+    re.I,
+)
+
+
+def _plain_par(p):
+    return _clean(unescape(re.sub(r"<[^>]+>", " ", p)))
+
+
+def is_source_par(p):
+    """Короткий абзац-посилання на джерело: «Про це повідомляє Reuters.», «Про це свідчить
+    дослідження компанії Gradus.», «Про це повідомляє Sun Boxing на YouTube.» тощо."""
+    plain = _plain_par(p)
+    return bool(plain) and len(plain) <= 300 and bool(SOURCE_PAR_RE.match(plain))
+
+
+def move_source_to_second(content):
+    """Абзаци із джерелом ставимо одразу після першого абзацу (другими),
+    а не в кінець статті. Решта порядку не змінюється."""
+    parts = UNIT_RE.split(content)
+    if any(parts[i].strip() for i in range(0, len(parts), 2)):
+        return content  # є текст поза <p>/<blockquote>: не чіпаємо
+    units = [parts[i] for i in range(1, len(parts), 2)]
+    first = next((i for i, u in enumerate(units) if u.lower().startswith("<p")), None)
+    if first is None:
+        return content
+    src = [
+        i for i, u in enumerate(units)
+        if i > first and u.lower().startswith("<p") and is_source_par(u)
+    ]
+    if not src or src == list(range(first + 1, first + 1 + len(src))):
+        return content  # джерела немає або воно вже другим
+    moved = [units[i] for i in src]
+    rest = [u for i, u in enumerate(units) if i not in set(src)]
+    new = rest[: first + 1] + moved + rest[first + 1:]
+    print("Абзац із джерелом переставлено на друге місце")
+    return "\n".join(new)
+
+
 def add_target_blank(content):
     """Посилання відкриваються в новій вкладці."""
     return re.sub(r"<a\s+(?![^>]*\btarget=)", '<a target="_blank" rel="noopener" ', content, flags=re.I)
@@ -1403,6 +1453,7 @@ def rewrite_checked(title, text, links=None):
     if miss_l:  # гарантія: посилання не втрачаються
         print("Посилання додано другим абзацом:", [l["url"] for l in miss_l])
         data["content"] = add_missing_links(data["content"], miss_l)
+    data["content"] = move_source_to_second(data["content"])
     data["content"] = add_target_blank(data["content"])
     return data, POST_STATUS
 
