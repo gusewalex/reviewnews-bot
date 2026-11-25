@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from html import escape, unescape
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
@@ -32,10 +32,6 @@ WP_URL = os.environ["WP_URL"].rstrip("/")
 WP_USER = os.environ["WP_USER"]
 WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-
-# базова адреса сторінок позначок і скільки ключових слів робити посиланнями
-TAG_BASE_URL = (os.environ.get("TAG_BASE_URL") or (WP_URL + "/tag")).rstrip("/")
-KEYWORD_LINKS = int(os.environ.get("KEYWORD_LINKS", "3") or 0)
 
 POST_STATUS = os.environ.get("POST_STATUS", "publish")  # publish або draft
 MAX_POSTS = int(os.environ.get("MAX_POSTS", "10"))     # скільки новин за одну перевірку
@@ -1280,99 +1276,6 @@ def final_outlet_cleanup(content):
     return re.sub(r"<p>\s*Про це\s*\.\s*</p>\s*", "", c)
 
 
-# ---------- Ключові слова як посилання на сторінки позначок ----------
-def tag_slug(tag):
-    """ЗЕЛЕНСЬКИЙ -> зеленський, ВЕРХОВНА РАДА -> верховна-рада"""
-    s = re.sub(r"[’'ʼ`]", "", tag.strip().lower())
-    return re.sub(r"\s+", "-", s)
-
-
-def _link_first(content, anchor, href):
-    """Робить посиланням перше входження anchor у звичайному тексті
-    (поза <a> та іншими тегами). Повертає (HTML, чи_вдалося)."""
-    pat = re.compile(r"(?<!\w)" + re.escape(escape(anchor, quote=False)) + r"(?!\w)", re.I)
-    tokens = re.split(r"(<a\b.*?</a>|<[^>]+>)", content, flags=re.S | re.I)
-    for i, tok in enumerate(tokens):
-        if i % 2 == 1 or not tok:  # непарні елементи: теги й готові посилання
-            continue
-        m = pat.search(tok)
-        if m:
-            tokens[i] = tok[: m.start()] + f'<a href="{escape(href)}">{m.group(0)}</a>' + tok[m.end():]
-            return "".join(tokens), True
-    return content, False
-
-
-KEYWORD_PROMPT = """Ти редактор українського новинного сайту. Тобі дають готовий текст новини.
-Обери в ньому від 4 до 6 найважливіших сутностей, які варто зробити посиланнями
-на сторінки позначок. Це власні назви, що є головними героями чи темою саме ЦІЄЇ
-новини: особи (прізвища), країни, міста й регіони, органи влади, відомства й
-служби, партії, організації, спортивні клуби, компанії.
-НЕ обирай: назви видань-джерел, загальні слова (війна, уряд, ситуація),
-слова, які вже є посиланнями, дати й числа. Бери лише те, що справді є в тексті.
-Для кожної сутності вкажи:
-- "anchor": ТОЧНИЙ фрагмент тексту, символ у символ, як він написаний у новині
-  (той самий відмінок і регістр), від 1 до 3 слів, без прийменника;
-- "tag": та сама сутність у називному відмінку, великими літерами, 1-3 слова
-  (наприклад, форма «Верховної Ради» дає позначку ВЕРХОВНА РАДА).
-Відсортуй за важливістю: найголовніша перша.
-Поверни JSON: {"keywords": [ ... ]}, де кожен елемент має поля "anchor" і "tag"."""
-
-
-def pick_keywords(content):
-    """Окремий запит до GPT: найважливіші власні назви з готового тексту статті."""
-    plain = _clean(re.sub(r"<[^>]+>", " ", content))
-    resp = client.chat.completions.create(
-        model=MODEL,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": KEYWORD_PROMPT},
-            {"role": "user", "content": plain[:6000]},
-        ],
-    )
-    return json.loads(resp.choices[0].message.content).get("keywords") or []
-
-
-def apply_keyword_links(data):
-    """Лінкує до KEYWORD_LINKS найважливіших власних назв статті
-    (Трамп, Верховна Рада, СБУ, Мбапе...) на сторінки позначок сайту."""
-    if KEYWORD_LINKS <= 0:
-        return
-    try:
-        cands = pick_keywords(data["content"])
-    except Exception as e:
-        print("Ключові слова не визначено:", e)
-        return
-    tags = clean_tags(data.get("tags"))
-    linked, used_tags = 0, set()
-    for kw in cands:
-        if linked >= KEYWORD_LINKS:
-            break
-        if not isinstance(kw, dict):
-            continue
-        anchor = _clean(str(kw.get("anchor") or "")).strip(" «»„“”\".,;:")
-        tag_list = clean_tags([kw.get("tag")])
-        if not anchor or not tag_list or len(anchor) > 60 or OUTLET_ANY_RE.fullmatch(anchor):
-            continue
-        tag = tag_list[0]
-        if tag in used_tags:
-            continue
-        href = f"{TAG_BASE_URL}/{quote(tag_slug(tag))}"
-        content, ok = _link_first(data["content"], anchor, href)
-        if not ok and anchor.lower() != tag.lower():  # запасний варіант: саме слово позначки
-            content, ok = _link_first(data["content"], tag, href)
-        if ok:
-            data["content"] = content
-            used_tags.add(tag)
-            linked += 1
-            if tag not in tags:
-                tags.append(tag)  # щоб сторінка позначки існувала
-        else:
-            print("Ключове слово не знайдено в тексті, пропускаю:", anchor)
-    data["tags"] = tags
-    print("Ключові слова-посилання:", linked, sorted(used_tags))
-
-
 def rewrite_checked(title, text, links=None):
     """Переписує новину. Прямі цитати та посилання на джерела гарантовано
     переносяться з оригіналу без змін. Повертає (дані, статус_публікації)."""
@@ -1449,7 +1352,6 @@ def rewrite_checked(title, text, links=None):
         print("Посилання додано другим абзацом:", [l["url"] for l in miss_l])
         data["content"] = add_missing_links(data["content"], miss_l)
     data["content"] = add_target_blank(data["content"])
-    apply_keyword_links(data)  # після add_target_blank: внутрішні посилання відкриваються в тій самій вкладці
     return data, POST_STATUS
 
 
@@ -1517,15 +1419,15 @@ def insert_figures(content, figures):
     return "".join(out)
 
 
-def clean_tags(raw, limit=8):
-    """Лишає унікальні позначки великими літерами."""
+def clean_tags(raw):
+    """Лишає до 3 унікальних позначок великими літерами."""
     tags = []
     for t in raw or []:
         t = re.sub(r"[#,]", " ", str(t))
         t = re.sub(r"\s+", " ", t).strip().upper()
         if t and t not in tags:
             tags.append(t)
-    return tags[:limit]
+    return tags[:3]
 
 
 def get_tag_ids(names):
