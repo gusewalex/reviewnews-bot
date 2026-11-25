@@ -27,6 +27,7 @@ FEEDS = [
 # Стрічки, яких тут немає, публікуються без вказаної категорії (як раніше).
 FEED_CATEGORIES = {
     "https://nv.ua/ukr/rss/2371.xml": "СПОРТ",
+     "https://nv.ua/rss/154.xml": "АВТО",
 }
 
 WP_URL = os.environ["WP_URL"].rstrip("/")
