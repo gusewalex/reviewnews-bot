@@ -606,13 +606,16 @@ def find_photo_caption(html_text, image_url, is_main=False):
 
 
 # ---------- Заборона фото Getty Images у тілі статті ----------
-GETTY_RE = re.compile(r"getty", re.I)
+# У тексті: Getty Images / GETTY IMAGES / Getty / GettyImages / Гетті (але не «Gettysburg»)
+GETTY_RE = re.compile(r"(?<!\w)(?:getty(?:[\s_-]*images)?|гетт[иі]\w*)(?!\w)", re.I)
+# В адресі картинки: gettyimages.com, .../getty_123.jpg
+GETTY_URL_RE = re.compile(r"gettyimages|(?<![a-z])getty(?![a-z])", re.I)
 
 
 def is_getty_image(html_text, image_url):
     """True, якщо фото на сторінці-першоджерелі підписане Getty Images
     (у підписі, alt/title, адресі картинки або в тексті поруч із фото)."""
-    if GETTY_RE.search(image_url or ""):
+    if GETTY_URL_RE.search(image_url or ""):
         return True
     if not html_text:
         return False
