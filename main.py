@@ -605,6 +605,47 @@ def find_photo_caption(html_text, image_url, is_main=False):
     return None
 
 
+# ---------- Заборона фото Getty Images у тілі статті ----------
+GETTY_RE = re.compile(r"getty", re.I)
+
+
+def is_getty_image(html_text, image_url):
+    """True, якщо фото на сторінці-першоджерелі підписане Getty Images
+    (у підписі, alt/title, адресі картинки або в тексті поруч із фото)."""
+    if GETTY_RE.search(image_url or ""):
+        return True
+    if not html_text:
+        return False
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        return False
+
+    # 1) підпис, знайдений звичайним способом (до очищення sanitize_caption)
+    if GETTY_RE.search(find_photo_caption(html_text, image_url) or ""):
+        return True
+
+    for img in _matching_imgs(doc, image_url):
+        # 2) alt / title самого зображення
+        if GETTY_RE.search((img.get("alt") or "") + " " + (img.get("title") or "")):
+            return True
+        # 3) короткий текст у найближчих контейнерах навколо фото
+        node = img
+        for _ in range(3):
+            node = node.getparent()
+            if node is None or not isinstance(node.tag, str) or node.tag in ("body", "html", "article", "main"):
+                break
+            if len(node.xpath(".//img")) > 1:
+                break
+            t = _text(node)
+            if len(t) <= 400 and GETTY_RE.search(t):
+                return True
+        # 4) рядок «Фото: Getty Images» одразу після фото
+        if GETTY_RE.search(_sibling_caption(img) or ""):
+            return True
+    return False
+
+
 def rss_caption(entry):
     """Підпис до фото, який є безпосередньо в RSS-записі новини
     (media:credit, підписи в описі, alt зображення тощо)."""
@@ -1841,8 +1882,12 @@ def run_once():
                 if wp_url:
                     images.append((wp_url, caption))
 
-            # додаткові фото зі статті
+            # додаткові фото зі статті (фото Getty Images сюди не потрапляють;
+            # головне фото вище лишається як є, навіть якщо воно від Getty Images)
             for extra in find_article_images(page_html, link, [img_url, image]):
+                if is_getty_image(page_html, extra):
+                    print("Пропущено фото Getty Images (не вставляємо в статтю):", extra)
+                    continue
                 _, wp_url = upload_image(extra)
                 if not wp_url:
                     continue
