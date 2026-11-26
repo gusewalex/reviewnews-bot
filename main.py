@@ -19,7 +19,7 @@ FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
     "https://epravda.com.ua/rss/news/",
     "https://nv.ua/ukr/rss/2371.xml",
-    "https://nv.ua/rss/154.xml",
+    "https://nv.ua/ukr/rss/154.xml",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
@@ -27,7 +27,7 @@ FEEDS = [
 # Стрічки, яких тут немає, публікуються без вказаної категорії (як раніше).
 FEED_CATEGORIES = {
     "https://nv.ua/ukr/rss/2371.xml": "СПОРТ",
-    "https://nv.ua/rss/154.xml": "АВТО",
+    "https://nv.ua/ukr/rss/154.xml": "АВТО",
 }
 
 # Позначка на сайті (rn_news_badges_options у Snippets) для категорій:
