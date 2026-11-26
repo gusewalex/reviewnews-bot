@@ -27,8 +27,20 @@ FEEDS = [
 # Стрічки, яких тут немає, публікуються без вказаної категорії (як раніше).
 FEED_CATEGORIES = {
     "https://nv.ua/ukr/rss/2371.xml": "СПОРТ",
-     "https://nv.ua/rss/154.xml": "АВТО",
+    "https://nv.ua/rss/154.xml": "АВТО",
 }
+
+# Позначка на сайті (rn_news_badges_options у Snippets) для категорій:
+# назва категорії WordPress (великими літерами) -> ключ позначки
+CATEGORY_BADGES = {
+    "СПОРТ": "sport",
+    "АВТО": "auto",
+}
+# Назва мета-поля запису, у якому ваш Snippet зберігає позначку. Якщо у Snippets
+# інша назва, вкажіть її тут або через змінну середовища BADGE_META_KEY.
+BADGE_META_KEY = os.environ.get("BADGE_META_KEY", "rn_news_badge")
+# true, якщо Snippet зберігає позначки списком (кілька галочок), а не одним значенням
+BADGE_AS_LIST = os.environ.get("BADGE_AS_LIST", "").strip().lower() == "true"
 
 WP_URL = os.environ["WP_URL"].rstrip("/")
 WP_USER = os.environ["WP_USER"]
@@ -232,6 +244,59 @@ def get_article(url):
     return text, image, html
 
 
+# ---------- Повні підписи для sport.nv.ua ----------
+# Для цих джерел підпис до фото беремо повністю: «Опис (Фото: джерело)»
+FULL_CAPTION_HOSTS = ["sport.nv.ua"] + [
+    x.strip().lower().removeprefix("www.")
+    for x in (os.environ.get("FULL_CAPTION_HOSTS") or "").split(",")
+    if x.strip()
+]
+FULL_CAPTION_FEEDS = {"https://nv.ua/ukr/rss/2371.xml"}  # спортивна стрічка NV
+_FULL = {"on": False}  # вмикається на час обробки однієї новини
+
+
+def _lim(normal, full):
+    """Ліміт довжини підпису: ширший для джерел із повними підписами."""
+    return full if _FULL["on"] else normal
+
+
+def is_full_caption_source(link, feed=None):
+    h = urlparse(link or "").netloc.lower().removeprefix("www.")
+    return feed in FULL_CAPTION_FEEDS or any(h == x or h.endswith("." + x) for x in FULL_CAPTION_HOSTS)
+
+
+CREDIT_TAIL_RE = re.compile(
+    r"^(?P<desc>.*?\S)\s*[.,;:—–-]?\s*"
+    r"(?P<credit>(?:Ілюстративне\s+)?Фото\s*:\s*[^()]{2,150}?)\s*\.?$",
+    re.I,
+)
+
+
+def normalize_photo_caption(c):
+    """«Опис. Фото: джерело» -> «Опис (Фото: джерело)». Підпис уже у вигляді
+    «Опис (Фото: ...)» або лише «Фото: ...» не змінюється."""
+    c = _clean(c)
+    if not c or ("(" in c and ")" in c):
+        return c
+    m = CREDIT_TAIL_RE.match(c)
+    if not m:
+        return c
+    desc = m.group("desc").rstrip(" .,;:—–-")
+    return f"{desc} ({m.group('credit').strip()})" if desc else c
+
+
+def pick_full_caption(page_c, rss_c):
+    """Найповніший підпис: той, де є вказівка «Фото: ...», а серед таких найдовший."""
+    cands = [(c, src) for c, src in ((page_c, "сторінка новини"), (rss_c, "RSS")) if c]
+    if not cands:
+        return None, "RSS"
+    def score(item):
+        c = item[0]
+        return (bool(re.search(r"\(?\s*(?:ілюстративне\s+)?фото\s*:", c, re.I)), len(c))
+    c, src = max(cands, key=score)
+    return normalize_photo_caption(c), src
+
+
 # ---------- Підпис до фото (як у новині-першоджерелі) ----------
 CAPTION_HINT = re.compile(
     r"caption|credit|descr|signature|підпис|подпис|author|source|copyright|byline|photographer"
@@ -255,7 +320,7 @@ def _caption_from_text(t):
     t = _clean(t)
     if not t:
         return None
-    if len(t) <= 200:
+    if len(t) <= _lim(200, 600):
         return t
     m = CREDIT_RE.search(t)
     return _clean(m.group(0)) if m else None
@@ -361,7 +426,7 @@ def _text(el):
 def looks_like_caption(t):
     """Короткий текст, схожий на підпис під фото (є вказівка «фото ...», «скріншот: ...»)."""
     t = _clean(t)
-    if not t or len(t) > 250:
+    if not t or len(t) > _lim(250, 600):
         return False
     return bool(CREDIT_START_RE.match(t) or CAPTION_END_RE.search(t))
 
@@ -413,7 +478,7 @@ def _join_caption(texts):
         elif len(t) <= 60:
             t = f"(Фото: {t})"
         main = f"{main} {t}"
-    return main if len(main) <= 300 else _caption_from_text(main)
+    return main if len(main) <= _lim(300, 700) else _caption_from_text(main)
 
 
 def _structural_caption(img):
@@ -435,7 +500,7 @@ def _structural_caption(img):
         t = _text(parent)
         if (
             t
-            and len(t) <= 300
+            and len(t) <= _lim(300, 600)
             and not parent.xpath(".//p|.//h1|.//h2|.//h3|.//ul|.//ol")
             and not re.fullmatch(r"[\d\s.:/,\-]+", t)  # лише дата/час: не підпис
         ):
@@ -1724,7 +1789,7 @@ def insert_videos(content, embeds):
     return "".join(out)
 
 
-def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None, main_in_body=True):
+def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None, main_in_body=True, badge=None):
     """images: список (адреса фото на вашому сайті, підпис або None);
     videos: список ідентифікаторів відео YouTube."""
     figures = [build_figure(u, c, data["title"]) for u, c in images]
@@ -1744,9 +1809,19 @@ def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, cat
         payload["categories"] = category_ids
     if date_gmt:
         payload["date_gmt"] = date_gmt  # час публікації як у джерела
+    if badge:  # позначка на сайті (СПОРТ, АВТО): мета-поле запису
+        payload["meta"] = {BADGE_META_KEY: [badge] if BADGE_AS_LIST else badge}
     resp = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", auth=auth, json=payload, timeout=60)
     resp.raise_for_status()
-    return resp.json().get("link")
+    j = resp.json()
+    if badge:
+        saved = (j.get("meta") or {}).get(BADGE_META_KEY) if isinstance(j.get("meta"), dict) else None
+        if saved in (None, "", []):
+            print(f"УВАГА: позначку «{badge}» сайт не підтвердив: мета-поле {BADGE_META_KEY} "
+                  "не зареєстроване для REST або має іншу назву")
+        else:
+            print("Позначка на сайті:", saved)
+    return j.get("link")
 
 
 def fetch_feed(feed_url):
@@ -1896,6 +1971,9 @@ def run_once():
         try:
             page_ok = True
             print("Обробляю:", link)
+            _FULL["on"] = is_full_caption_source(link, entry.get("_feed"))
+            if _FULL["on"]:
+                print("Джерело з повними підписами до фото (sport.nv.ua)")
             try:
                 text, image, page_html = get_article(link)
             except SkipArticle as e:
@@ -1936,7 +2014,9 @@ def run_once():
                     find_photo_caption(page_html, img_url, is_main=True)
                 ) if page_html else None
                 # повний підпис зі сторінки (з джерелом у дужках) має перевагу над обрізаним з RSS
-                if page_c and (not rss_c or (norm(rss_c) in norm(page_c) and len(page_c) > len(rss_c))):
+                if _FULL["on"]:
+                    caption, cap_src = pick_full_caption(page_c, rss_c)
+                elif page_c and (not rss_c or (norm(rss_c) in norm(page_c) and len(page_c) > len(rss_c))):
                     caption, cap_src = page_c, "сторінка новини"
                 else:
                     caption, cap_src = rss_c, "RSS"
@@ -1962,6 +2042,8 @@ def run_once():
                 if not wp_url:
                     continue
                 cap = sanitize_caption(find_photo_caption(page_html, extra))
+                if _FULL["on"]:
+                    cap = normalize_photo_caption(cap)
                 print("Додаткове фото:", extra, "| підпис:", cap or "(не знайдено, без підпису)")
                 images.append((wp_url, cap))
 
@@ -1982,12 +2064,17 @@ def run_once():
                     category_ids = [cid]
                 print("Категорія:", cat_name if cid else f"{cat_name} (не вдалося, без категорії)")
 
+            badge = CATEGORY_BADGES.get((cat_name or "").strip().upper())
+            if badge:
+                print("Позначка:", badge)
+
             post_link = create_post(
                 data, image_id, images, status, tag_ids,
                 entry_date_gmt(entry) if USE_SOURCE_DATE else None,
                 category_ids,
                 video_ids,
                 main_in_body,
+                badge,
             )
             print(f"Створено ({status}):", post_link)
             seen.append(link)
@@ -1997,6 +2084,7 @@ def run_once():
             print("Помилка з новиною", link, "->", e)
             errors.append(f"{link} -> {e}")
 
+    _FULL["on"] = False
     save_seen(seen)
     print(f"Готово. Нових матеріалів: {done}")
     write_summary(done, n_seen, n_short, errors, n_old, n_skip)
