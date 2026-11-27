@@ -19,7 +19,7 @@ FEEDS = [
     "https://www.pravda.com.ua/rss/view_news/",
     "https://epravda.com.ua/rss/news/",
     "https://nv.ua/ukr/rss/2371.xml",
-    "https://nv.ua/ukr/rss/154.xml",
+    "https://nv.ua/rss/154.xml",
     # Щоб додати ще джерело, додайте новий рядок з RSS-посиланням
 ]
 
@@ -27,7 +27,7 @@ FEEDS = [
 # Стрічки, яких тут немає, публікуються без вказаної категорії (як раніше).
 FEED_CATEGORIES = {
     "https://nv.ua/ukr/rss/2371.xml": "СПОРТ",
-    "https://nv.ua/ukr/rss/154.xml": "АВТО",
+    "https://nv.ua/rss/154.xml": "АВТО",
 }
 
 # Позначка на сайті (rn_news_badges_options у Snippets) для категорій:
@@ -36,11 +36,12 @@ CATEGORY_BADGES = {
     "СПОРТ": "sport",
     "АВТО": "auto",
 }
-# Назва мета-поля запису, у якому ваш Snippet зберігає позначку. Якщо у Snippets
-# інша назва, вкажіть її тут або через змінну середовища BADGE_META_KEY.
-BADGE_META_KEY = os.environ.get("BADGE_META_KEY", "rn_news_badge")
-# true, якщо Snippet зберігає позначки списком (кілька галочок), а не одним значенням
-BADGE_AS_LIST = os.environ.get("BADGE_AS_LIST", "").strip().lower() == "true"
+# Мета-поле, у якому Snippet «Позначки новини» зберігає плашки (СПИСОК ключів)
+BADGE_META_KEY = os.environ.get("BADGE_META_KEY", "_rn_news_badges")
+
+# Якщо в новині є відео YouTube: додатково категорії НОВИНИ та ВІДЕО і плашка 'video'
+VIDEO_CATEGORIES = ["НОВИНИ", "ВІДЕО"]
+VIDEO_BADGE = "video"
 
 WP_URL = os.environ["WP_URL"].rstrip("/")
 WP_USER = os.environ["WP_USER"]
@@ -1789,7 +1790,7 @@ def insert_videos(content, embeds):
     return "".join(out)
 
 
-def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None, main_in_body=True, badge=None):
+def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None, main_in_body=True, badges=None):
     """images: список (адреса фото на вашому сайті, підпис або None);
     videos: список ідентифікаторів відео YouTube."""
     figures = [build_figure(u, c, data["title"]) for u, c in images]
@@ -1809,18 +1810,21 @@ def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, cat
         payload["categories"] = category_ids
     if date_gmt:
         payload["date_gmt"] = date_gmt  # час публікації як у джерела
-    if badge:  # позначка на сайті (СПОРТ, АВТО): мета-поле запису
-        payload["meta"] = {BADGE_META_KEY: [badge] if BADGE_AS_LIST else badge}
+    if badges:  # плашки на сайті (СПОРТ, АВТО, ВІДЕО): мета-поле запису, список ключів
+        payload["meta"] = {BADGE_META_KEY: list(badges)}
     resp = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", auth=auth, json=payload, timeout=60)
     resp.raise_for_status()
     j = resp.json()
-    if badge:
-        saved = (j.get("meta") or {}).get(BADGE_META_KEY) if isinstance(j.get("meta"), dict) else None
-        if saved in (None, "", []):
-            print(f"УВАГА: позначку «{badge}» сайт не підтвердив: мета-поле {BADGE_META_KEY} "
-                  "не зареєстроване для REST або має іншу назву")
+    if badges:
+        meta_now = j.get("meta") if isinstance(j.get("meta"), dict) else {}
+        # ДІАГНОСТИКА: усі мета-поля, які сайт віддає через REST, і їхні значення
+        print("Мета-поля запису на сайті (REST):", {k: v for k, v in meta_now.items()} or "(порожньо: жодне поле не зареєстроване для REST)")
+        saved = meta_now.get(BADGE_META_KEY)
+        if not isinstance(saved, list) or set(saved) != set(badges):
+            print(f"УВАГА: плашки {badges} сайт не підтвердив (отримано: {saved!r}): поле {BADGE_META_KEY} "
+                  "не зареєстроване для REST (див. PHP-фрагмент) або має іншу назву")
         else:
-            print("Позначка на сайті:", saved)
+            print("Плашки на сайті:", saved)
     return j.get("link")
 
 
@@ -2064,9 +2068,22 @@ def run_once():
                     category_ids = [cid]
                 print("Категорія:", cat_name if cid else f"{cat_name} (не вдалося, без категорії)")
 
-            badge = CATEGORY_BADGES.get((cat_name or "").strip().upper())
-            if badge:
-                print("Позначка:", badge)
+            badges = []
+            b = CATEGORY_BADGES.get((cat_name or "").strip().upper())
+            if b:
+                badges.append(b)
+            if video_ids:  # у новині є відео YouTube: категорії НОВИНИ + ВІДЕО і плашка ВІДЕО
+                for vc in VIDEO_CATEGORIES:
+                    vcid = get_category_id(vc)
+                    if vcid and vcid not in category_ids:
+                        category_ids.append(vcid)
+                    elif not vcid:
+                        print(f"Категорію {vc} не знайдено й не створено")
+                if VIDEO_BADGE not in badges:
+                    badges.append(VIDEO_BADGE)
+                print("Є відео YouTube: категорії", VIDEO_CATEGORIES, "і плашка", VIDEO_BADGE)
+            if badges:
+                print("Плашки:", badges)
 
             post_link = create_post(
                 data, image_id, images, status, tag_ids,
@@ -2074,7 +2091,7 @@ def run_once():
                 category_ids,
                 video_ids,
                 main_in_body,
-                badge,
+                badges,
             )
             print(f"Створено ({status}):", post_link)
             seen.append(link)
