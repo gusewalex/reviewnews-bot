@@ -39,6 +39,9 @@ CATEGORY_BADGES = {
 # Мета-поле, у якому Snippet «Позначки новини» зберігає плашки (СПИСОК ключів)
 BADGE_META_KEY = os.environ.get("BADGE_META_KEY", "_rn_news_badges")
 
+# Блок «НОВИНИ ПО ТЕМІ:» унизу статті: скільки останніх новин із тими самими позначками (0 = вимкнено)
+RELATED_COUNT = int(os.environ.get("RELATED_COUNT", "3") or 0)
+
 # Якщо в новині є відео YouTube: додатково категорії НОВИНИ та ВІДЕО і плашка 'video'
 VIDEO_CATEGORIES = ["НОВИНИ", "ВІДЕО"]
 VIDEO_BADGE = "video"
@@ -1790,12 +1793,62 @@ def insert_videos(content, embeds):
     return "".join(out)
 
 
-def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None, main_in_body=True, badges=None):
+def find_related_posts(tag_ids, limit=None):
+    """Останні опубліковані новини з тими самими позначками. Позначки беруться за порядком
+    важливості: спершу з першої, а якщо їх мало, доповнюємо з наступних. Без дублів."""
+    limit = RELATED_COUNT if limit is None else limit
+    found, seen_ids = [], set()
+    if limit <= 0:
+        return found
+    for tid in tag_ids or []:
+        if len(found) >= limit:
+            break
+        try:
+            r = requests.get(
+                f"{WP_URL}/wp-json/wp/v2/posts",
+                auth=auth,
+                params={
+                    "tags": tid, "per_page": limit, "status": "publish",
+                    "orderby": "date", "order": "desc", "_fields": "id,link,title",
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            for p in r.json():
+                title = re.sub(r"<[^>]+>", "", (p.get("title") or {}).get("rendered", "")).strip()
+                if p.get("id") in seen_ids or not p.get("link") or not title:
+                    continue
+                seen_ids.add(p["id"])
+                found.append({"title": title, "link": p["link"]})  # title уже з HTML-сутностями WP
+                if len(found) >= limit:
+                    break
+        except Exception as e:
+            print("Новини по темі не отримано (позначка", tid, ")->", e)
+    return found
+
+
+def build_related_block(related):
+    """Блок унизу статті: «НОВИНИ ПО ТЕМІ:» і список посилань."""
+    if not related:
+        return ""
+    items = "".join(
+        f'<li><a href="{escape(r["link"])}">{r["title"]}</a></li>' for r in related
+    )
+    return (
+        '\n<div class="rn-related-news">'
+        "<p><strong>НОВИНИ ПО ТЕМІ:</strong></p>"
+        f"<ul>{items}</ul>"
+        "</div>"
+    )
+
+
+def create_post(data, image_id, images, status, tag_ids=None, date_gmt=None, category_ids=None, videos=None, main_in_body=True, badges=None, related=None):
     """images: список (адреса фото на вашому сайті, підпис або None);
     videos: список ідентифікаторів відео YouTube."""
     figures = [build_figure(u, c, data["title"]) for u, c in images]
     content = insert_figures(data["content"], figures, has_main=main_in_body)
     content = insert_videos(content, [build_youtube_embed(v, data["title"]) for v in (videos or [])])
+    content += build_related_block(related)  # унизу після тіла новини
     payload = {
         "title": data["title"],
         "content": content,
@@ -2059,6 +2112,8 @@ def run_once():
 
             tag_ids = get_tag_ids(data.get("tags"))
             print("Позначки:", clean_tags(data.get("tags")))
+            related = find_related_posts(tag_ids)
+            print("Новини по темі:", [r["title"][:50] for r in related] or "(немає)")
 
             cat_name = FEED_CATEGORIES.get(entry.get("_feed"))
             category_ids = []
@@ -2092,6 +2147,7 @@ def run_once():
                 video_ids,
                 main_in_body,
                 badges,
+                related,
             )
             print(f"Створено ({status}):", post_link)
             seen.append(link)
