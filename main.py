@@ -39,7 +39,7 @@ CATEGORY_BADGES = {
 # Мета-поле, у якому Snippet «Позначки новини» зберігає плашки (СПИСОК ключів)
 BADGE_META_KEY = os.environ.get("BADGE_META_KEY", "_rn_news_badges")
 
-# Блок «НОВИНИ ПО ТЕМІ:» унизу статті: скільки останніх новин із тими самими позначками (0 = вимкнено)
+# Блок «ЧИТАЙТЕ ТАКОЖ:» унизу статті: скільки останніх новин із тими самими позначками (0 = вимкнено)
 RELATED_COUNT = int(os.environ.get("RELATED_COUNT", "3") or 0)
 
 # Якщо в новині є відео YouTube: додатково категорії НОВИНИ та ВІДЕО і плашка 'video'
@@ -1828,7 +1828,7 @@ def find_related_posts(tag_ids, limit=None):
 
 
 def build_related_block(related):
-    """Блок унизу статті: «НОВИНИ ПО ТЕМІ:» і список посилань."""
+    """Блок унизу статті: «ЧИТАЙТЕ ТАКОЖ:» і список посилань."""
     if not related:
         return ""
     items = "".join(
@@ -1836,7 +1836,7 @@ def build_related_block(related):
     )
     return (
         '\n<div class="rn-related-news">'
-        "<p><strong>НОВИНИ ПО ТЕМІ:</strong></p>"
+        "<p><strong>ЧИТАЙТЕ ТАКОЖ:</strong></p>"
         f"<ul>{items}</ul>"
         "</div>"
     )
